@@ -204,12 +204,17 @@ class App:
         self._fonts = {}                                  # (family,size,weight) -> named Tk font
         self._tip_win = None                             # tooltip window + deferred display
         self._tip_after = None
+        self._wheel = {}                                 # widget path -> scroll fn (see _bind_wheel)
+        self._page = None                                # right column scroller: (canvas, sb, item, inner)
+        self._page_geom = None                           # last (width, height) pushed into the scroller
+        self._page_sb = None                             # is the page scrollbar currently packed
         self.cfg = dict(DEFAULTS)
         self._load()
         self._lb_mode = self.cfg.get('lb_mode') or 'all'   # remembered across restarts
         self.cfg['theme'] = _apply_palette(self.cfg.get('theme') or _system_theme())
         self._init_window()
         self._style()
+        self._install_wheel()                             # one global wheel grab, dispatched by hover
         self._build()
         self._poll()
         self._sig_tick()                                  # live status of the served signal APIs
@@ -406,6 +411,7 @@ class App:
     def _build(self):
         # Everything lives inside _shell so a theme switch can drop and rebuild the whole UI without
         # touching the root's other children (open dialogs, tooltips).
+        self._wheel.clear()                              # the old widget paths die with the shell
         self._shell = self._box(self.root, bg=BG)
         self._shell.pack(fill='both', expand=True)
         self._box(self._shell, bg=ACC, height=3).pack(fill='x')          # accent bar
@@ -754,27 +760,56 @@ class App:
             self._tip_win.destroy()
             self._tip_win = None
 
-    def _bind_wheel(self, canvas):
-        def _w(e):
+    def _install_wheel(self):
+        """One global wheel grab for the whole app, dispatched by what the pointer is over.
+
+        Tk delivers <MouseWheel> to the FOCUSED widget on Windows/macOS, and none of the scrollers
+        here ever take the focus — so the event is caught on the toplevel and routed by hit-test
+        instead. Walking up from the hovered widget makes the INNERMOST registered scroller win,
+        which is what keeps the leaderboard scrolling under the pointer while the page it sits on
+        scrolls everywhere else."""
+        def _route(e):
             d = -1 if (getattr(e, 'num', None) == 4 or getattr(e, 'delta', 0) > 0) else 1
-            canvas.yview_scroll(d, 'units')
+            try:
+                w = self.root.winfo_containing(e.x_root, e.y_root)
+            except Exception:                            # noqa: BLE001 — pointer outside our windows
+                return None
+            while w is not None:
+                fn = self._wheel.get(str(w))
+                if fn is not None:
+                    fn(d)
+                    return 'break'
+                w = getattr(w, 'master', None)
+            return None
+        for seq in ('<Button-4>', '<Button-5>', '<MouseWheel>'):
+            self.root.bind_all(seq, _route)
 
-        def _on(_e):
-            canvas.bind_all('<Button-4>', _w)
-            canvas.bind_all('<Button-5>', _w)
-            canvas.bind_all('<MouseWheel>', _w)
-
-        def _off(_e):
-            for seq in ('<Button-4>', '<Button-5>', '<MouseWheel>'):
-                canvas.unbind_all(seq)
-        canvas.bind('<Enter>', _on)
-        canvas.bind('<Leave>', _off)
+    def _bind_wheel(self, widget, scroll=None):
+        """Register `widget` (and everything inside it) as a wheel scroller."""
+        self._wheel[str(widget)] = scroll or (lambda d, w=widget: w.yview_scroll(d, 'units'))
 
     # ---------- right panel: status / chart / leaderboard ----------
     def _build_status(self, body):
-        right = self._box(body, bg=BG)
-        right.grid(row=0, column=1, sticky='nsew')
-        right.rowconfigure(3, weight=1)                  # the leaderboard takes the slack
+        # The column scrolls as a page. Its cards stack taller than the window as soon as a
+        # portfolio is built or a signal API is served, and grid() takes that overflow out of the
+        # one row that has a weight — the leaderboard — so the table silently collapsed to zero
+        # height ("the leaderboard disappears after Serve"). With a scroller the cards keep their
+        # own height and the overflow becomes scroll instead.
+        outer = self._box(body, bg=BG)
+        outer.grid(row=0, column=1, sticky='nsew')
+        canvas = tk.Canvas(outer, bg=BG, highlightthickness=0)
+        canvas.pack(side='left', fill='both', expand=True)
+        page_sb = ctk.CTkScrollbar(outer, orientation='vertical', command=canvas.yview, fg_color=BG,
+                                   button_color=BORDER, button_hover_color=FAINT, width=14)
+        canvas.configure(yscrollcommand=page_sb.set)
+        right = self._box(canvas, bg=BG)
+        item = canvas.create_window((0, 0), window=right, anchor='nw')
+        self._page = (canvas, page_sb, item, right)
+        self._page_geom = self._page_sb = None
+        canvas.bind('<Configure>', self._sync_page)
+        right.bind('<Configure>', self._sync_page)
+        self._bind_wheel(canvas)
+        right.rowconfigure(3, weight=1)                  # spare height goes to the leaderboard
         right.columnconfigure(0, weight=1)
 
         card = self._card(right)
@@ -868,6 +903,7 @@ class App:
         self.tree.configure(yscrollcommand=self._on_tree_scroll)   # scroll -> load metrics for the viewport
         self.tree.pack(side='left', fill='both', expand=True)
         vsb.pack(side='right', fill='y', padx=(4, 0))
+        self._bind_wheel(self.tree, self._tree_wheel)     # wheel over the table scrolls the table
         self.tree.bind('<Double-1>', self._on_row_open)
         self.tree.bind('<Button-3>', self._on_row_menu)             # right-click — context menu
         self.tree.bind('<Control-c>', lambda e: self._copy_formula())
@@ -930,6 +966,65 @@ class App:
         self.pf_img.pack(fill='x', pady=(8, 0))
         card3.bind('<Configure>', self._on_pf_resize)         # re-render equity to the panel width
         self.root.after(500, self._load_portfolio_on_start)   # show last build, if any
+
+    def _sync_page(self, _e=None):
+        """Keep the scrolled page exactly as wide as the viewport and at least as tall: a page that
+        fits still hands its spare height to the leaderboard (row 3 has the weight), a taller one
+        scrolls instead of stealing that height."""
+        if not self._page:
+            return
+        canvas, sb, item, inner = self._page
+        if not canvas.winfo_exists():
+            return
+        cw, ch = canvas.winfo_width(), canvas.winfo_height()
+        if cw <= 1 or ch <= 1:                           # not laid out yet
+            return
+        req = inner.winfo_reqheight()
+        # height 0 = the item follows the frame's OWN request. That is the whole trick: pinning it
+        # to a number would put the grid back in the business of squeezing the weighted row, and a
+        # card appearing (SIGNAL API) would come straight out of the leaderboard again — the frame
+        # only reports the new request, its geometry never changes, so nothing here would fire.
+        want = (cw, 0 if req > ch else ch)
+        if want != self._page_geom:
+            self._page_geom = want
+            canvas.itemconfigure(item, width=want[0], height=want[1])
+        h = max(req, ch)
+        canvas.configure(scrollregion=(0, 0, cw, h))
+        need = h > ch
+        if need != self._page_sb:                        # the bar shows only while it can do something
+            self._page_sb = need
+            if need:
+                sb.pack(side='right', fill='y', padx=(6, 0))
+            else:
+                sb.pack_forget()
+                canvas.yview_moveto(0)
+
+    def _scroll_to(self, widget):
+        """Bring a card of the right column into view — the page is taller than the window, and a
+        card that appears above the fold (SIGNAL API, right after Serve) is the thing the user just
+        asked for."""
+        if not self._page or not widget.winfo_ismapped():
+            return
+        canvas, _sb, _item, inner = self._page
+        canvas.update_idletasks()
+        top = widget.winfo_rooty() - inner.winfo_rooty()      # y of the card inside the page
+        h = max(inner.winfo_reqheight(), 1)
+        view, ch = canvas.canvasy(0), canvas.winfo_height()
+        if top < view or top + widget.winfo_height() > view + ch:
+            canvas.yview_moveto(max(0.0, top - 12) / h)
+
+    def _tree_wheel(self, d):
+        """Wheel over the table scrolls the table — until it is already at that end, then the page
+        takes over, so the scroll never dead-ends inside the leaderboard."""
+        try:
+            first, last = self.tree.yview()
+        except tk.TclError:
+            first, last = 0.0, 1.0
+        if (d < 0 and first <= 0.0) or (d > 0 and last >= 1.0):
+            if self._page:
+                self._page[0].yview_scroll(d, 'units')
+            return
+        self.tree.yview_scroll(d, 'units')
 
     def _load_portfolio_on_start(self):
         try:
@@ -1362,6 +1457,7 @@ class App:
             return
         if any(s['label'] == label for s in self._sigs):   # already serving this one — just show it
             self._render_signal_rows()
+            self._scroll_to(self.sig_card)
             return
         port = self._free_signal_port()
         if port is None:
@@ -1389,6 +1485,7 @@ class App:
         self._sig_health[port] = 'starting — fetching live data, computing the first signal…'
         self._sig_save()
         self._render_signal_rows()
+        self._scroll_to(self.sig_card)                    # the card is above the fold — show it
 
     def _pf_serve_signal(self):
         doc = self._pf_doc
