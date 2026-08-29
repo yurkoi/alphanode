@@ -1809,11 +1809,13 @@ class App:
                   '(an annualized rate — comparable across universes and periods)',
             'act': 'trades per asset per year — relative activity',
             'win': 'share of profitable days on TEST',
-            'wup': 'win rate on TRENDING-UP market bars only — the same direction\n'
-                   'regime as T↑ (see its tooltip). \'—\' = under 30 such bars on TEST,\n'
-                   'or fewer than 5 bars where the formula actually traded there.',
-            'wdown': 'win rate on TRENDING-DOWN market bars only.\n'
-                     'Same direction regime as T↑ — see that column\'s tooltip.',
+            'wup': 'accuracy of the formula\'s UP calls: every (bar, asset) where it\n'
+                   'held a LONG position at the prior close, judged by that asset\'s\n'
+                   'next bar — right when the price rose. A bar where the price didn\'t\n'
+                   'move judges nothing. \'—\' = under 30 such calls on TEST, or fewer\n'
+                   'than 5 where the price actually moved.',
+            'wdown': 'accuracy of the formula\'s DOWN calls — short positions, right\n'
+                     'when the price fell. Same evidence floors as win ↑.',
             'id': 'stable ID — the md5 tail of the formula; the forward track uses the SAME id',
             'formula': 'the alpha itself — right-click: copy / choose columns',
         }
@@ -4406,7 +4408,7 @@ class App:
                               'test_dd', 'test_cagr', 'test_sortino',
                               'test_sh_trend_up', 'test_sh_trend_down',
                               'test_sh_flat', 'long', 'short', 'long_yr_a', 'short_yr_a',
-                              'tr_yr_a', 'win_pct', 'win_up_pct', 'win_down_pct',
+                              'tr_yr_a', 'win_pct', 'call_acc_up_pct', 'call_acc_down_pct',
                               'id', 'formula'), out, 'rows')
 
     def _export_library(self):
@@ -5311,8 +5313,8 @@ class App:
                                  f"   ·   T~ {self._fmt_ratio(_m.get('tflat'))}  (Sharpe)",
                       text_color=MUT, anchor='w', font=(self.UI, 11)).pack(anchor='w')
         if isinstance(_m, dict) and any(_m.get(k) is not None for k in ('wup', 'wdown')):
-            self._lbl(head, text=f"win rate by direction:   W↑ {self._fmt_winpct(_m.get('wup'))}"
-                                 f"   ·   W↓ {self._fmt_winpct(_m.get('wdown'))}",
+            self._lbl(head, text=f"call accuracy:   long {self._fmt_winpct(_m.get('wup'))}"
+                                 f"   ·   short {self._fmt_winpct(_m.get('wdown'))}",
                       text_color=MUT, anchor='w', font=(self.UI, 11)).pack(anchor='w')
         self._lbl(head, text=champ.get('formula', ''), text_color=MUT, justify='left', anchor='w',
                      wraplength=img_w - 30, font=(self.MONO, 12)).pack(anchor='w', pady=(6, 0))
