@@ -3,7 +3,9 @@ per-bar win rate — the SAME number the leaderboard's win% column shows — as
 min(TRAIN, VAL), with every Sharpe-calibrated penalty rescaled to the win-rate
 scale (0.25-wide vs 2.5-wide: unscaled parsimony alone would collapse the GP into
 stumps). TEST stays held out. The leaderboard grows longs/shorts per asset per
-year and win rate by market direction (wup/wdown on the lagged trend labels)."""
+year and call accuracy by predicted side (wup/wdown: long cells judged by the
+asset's next-bar rise, short cells by its fall — the formula's own calls, not
+the market regime)."""
 import configparser
 import io
 import os
@@ -200,16 +202,59 @@ def test_rescore_keeps_the_winrate_objective(monkeypatch):
 
 # ---------- worker: the new leaderboard numbers ----------
 
-def test_regime_winrate_guards_and_value():
+def test_call_accuracy_guards_and_orientation():
     import metrics_worker as mw
     rng = np.random.default_rng(3)
     x = np.where(np.arange(90) % 3 == 0, -0.01, 0.01) + rng.normal(0, 1e-6, 90)
-    assert mw.regime_winrate(x) == pytest.approx(2 / 3, abs=1e-9)
-    assert mw.regime_winrate(x[:20]) is None             # under 30 bars: no evidence
-    assert mw.regime_winrate(np.zeros(50)) is None       # never traded in the regime
+    assert mw.call_accuracy(x, up=True) == pytest.approx(2 / 3, abs=1e-9)     # long calls: rises are right
+    assert mw.call_accuracy(x, up=False) == pytest.approx(1 / 3, abs=1e-9)    # short calls: falls are right
+    assert mw.call_accuracy(x[:20], up=True) is None     # under 30 calls: no evidence
+    assert mw.call_accuracy(np.zeros(50), up=True) is None   # nothing ever moved: nothing judged
 
 
-def test_trade_stats_emits_annualized_sides_and_regime_winrates():
+def test_call_accuracy_judges_the_formulas_own_calls():
+    """abs(...) never goes short, so win↓ has no calls to judge; neg(abs(...)) holds the
+    EXACT mirror book on the same cells (weights normalize to −W), so its down-accuracy
+    must complement the long twin's up-accuracy to 1 — flat cells drop out of both."""
+    import metrics_worker as mw
+    cp = configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
+    cp.read(os.environ['ALPHANODE_CONFIG_INI'])
+    seg = cp['segments']
+    ctx = mw.build_ctx({'formulas': ['abs(tanh(ret))'],
+                        'train_start': seg['train_start'].strip(),
+                        'test_start': seg['test_start'].strip(),
+                        'test_end': seg['test_end'].strip()})
+    lo = mw.trade_stats('abs(tanh(ret))', ctx)
+    sh = mw.trade_stats('neg(abs(tanh(ret)))', ctx)
+    assert isinstance(lo, dict) and isinstance(sh, dict)
+    assert lo['short'] == 0 and sh['long'] == 0          # no calls on the silent side…
+    assert lo['wdown'] is None and sh['wup'] is None     # …means nothing to be accurate about
+    assert lo['wup'] is not None and sh['wdown'] is not None
+    assert lo['wup'] + sh['wdown'] == pytest.approx(1.0)
+
+
+def test_call_accuracy_judges_the_NEXT_bar_not_the_current_one():
+    """The lag is the whole column. 'ret' as a signal goes long exactly the assets that
+    rose on the bar it is computed from, so scoring a call against its OWN bar reads a
+    perfect 100% — a mirage of pure hindsight. Scored against the bar the position is
+    actually held into (the one the simulator books PnL on) the same signal lands near a
+    coin flip, which is the truth about yesterday's return as a predictor. Measured:
+    0.48 shipped vs 1.00 for the off-by-one."""
+    import metrics_worker as mw
+    cp = configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
+    cp.read(os.environ['ALPHANODE_CONFIG_INI'])
+    seg = cp['segments']
+    ctx = mw.build_ctx({'formulas': ['ret'],
+                        'train_start': seg['train_start'].strip(),
+                        'test_start': seg['test_start'].strip(),
+                        'test_end': seg['test_end'].strip()})
+    m = mw.trade_stats('ret', ctx)
+    assert isinstance(m, dict)
+    for k in ('wup', 'wdown'):
+        assert 0.35 < m[k] < 0.65, f'{k}={m[k]} — a hindsight signal cannot be this good'
+
+
+def test_trade_stats_emits_annualized_sides_and_call_accuracy():
     import metrics_worker as mw
     cp = configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
     cp.read(os.environ['ALPHANODE_CONFIG_INI'])

@@ -313,7 +313,7 @@ nav{border-bottom:1px solid var(--line)}
           <li><a href="#e6-12"><span class="num">6.12</span><span class="txt">tr/yr·a</span><span class="pg" data-num="6.12">24</span></a></li>
           <li><a href="#e6-13"><span class="num">6.13</span><span class="txt">win%</span><span class="pg" data-num="6.13">24</span></a></li>
           <li><a href="#e6-14"><span class="num">6.14</span><span class="txt">win ↑</span><span class="pg" data-num="6.14">24</span></a></li>
-          <li><a href="#e6-15"><span class="num">6.15</span><span class="txt">win ↓</span><span class="pg" data-num="6.15">24</span></a></li>
+          <li><a href="#e6-15"><span class="num">6.15</span><span class="txt">win ↓</span><span class="pg" data-num="6.15">25</span></a></li>
           <li><a href="#e6-16"><span class="num">6.16</span><span class="txt">ID</span><span class="pg" data-num="6.16">25</span></a></li>
           <li><a href="#e6-17"><span class="num">6.17</span><span class="txt">formula</span><span class="pg" data-num="6.17">25</span></a></li>
         </ol>
@@ -710,12 +710,12 @@ nav{border-bottom:1px solid var(--line)}
       </div>
       <div class="item" id="e6-14">
         <div class="hd"><h3><span class="num">6.14</span>win ↑</h3><span class="pill">default <b>shown by default</b></span></div>
-        <p>Win rate on confidently up-trending bars — same regime and same one-bar lag as T ↑. Use it with T ↑ to separate two failure modes: decent win↑ with poor T↑ means the formula wins often but its losses are large; poor win↑ with decent T↑ means it wins rarely and wins big. Both are real strategies, needing very different sizing and very different patience from you.</p>
-        <p class="warn"><b>Watch out.</b> A stricter evidence bar than the T columns: 30 bars in the regime AND at least 5 where the formula made or lost something. A dash here beside a numeric T↑ just means it was mostly flat during up-trends.</p>
+        <p>The share of the formula&#x27;s UP calls that came true. Every (bar, asset) cell where the formula held a long position at the previous close is a call that this asset rises over the next bar — exactly the bet the simulator books PnL on. The cell counts as right when the price rose, wrong when it fell, and as nothing when it did not move. Unlike T ↑, which slices the equity curve by what the MARKET was doing, this judges what the FORMULA said, asset by asset. Fees and position size do not enter — this is pure directional skill on the long book, which is why a formula can show a healthy win↑ and still lose money: it calls direction well but its rare misses are large.</p>
+        <p class="warn"><b>Watch out.</b> Two evidence floors: 30 long calls on TEST AND at least 5 where the price actually moved. A dash beside busy L entry counts means the assets it held barely moved. Note what the percentage divides by: only the calls where the price MOVED, not every held cell. On a normal run that is thousands of cells and a 52% is a real edge, but the floors let a formula through on as few as five judged cells — read this column beside L / S and tr/yr·a, and treat a high number from a barely-trading formula as the coin flip it is.</p>
       </div>
       <div class="item" id="e6-15">
         <div class="hd"><h3><span class="num">6.15</span>win ↓</h3><span class="pill">default <b>shown by default</b></span></div>
-        <p>Win rate on confidently down-trending bars, same definition and the same two evidence floors. The stress-test companion to T ↓: if win↓ collapses while win↑ stays high, the formula is a long-bias machine whatever its entry counts suggest.</p>
+        <p>The same precision on the formula&#x27;s DOWN calls — cells where it held a short position, right when the price fell over the next bar. Same two evidence floors as win ↑. Read the pair together: win↑ 56% against win↓ 48% says the short book is guesswork riding along with a genuine long edge — a long-bias machine whatever its entry counts suggest. A formula that never shorts shows a dash here: it made no down calls, so there is nothing to be accurate about.</p>
       </div>
       <div class="item" id="e6-16">
         <div class="hd"><h3><span class="num">6.16</span>ID</h3><span class="pill">default <b>shown by default</b></span></div>

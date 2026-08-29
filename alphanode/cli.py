@@ -209,7 +209,8 @@ def cmd_top(args):
     if stats is not None:
         print('\nT↑/T↓/T~ = TEST Sharpe on trending-up / trending-down / flat market bars '
               '(direction regime: drift t-stat over ~30 calendar days, labels lagged one '
-              'bar); win↑/win↓ = win rate on the same up/down bars; L/S/yr·a = positions '
+              'bar); win↑/win↓ = accuracy of the formula’s own long / short calls — each held '
+              '(bar, asset) cell judged by that asset’s next-bar move; L/S/yr·a = positions '
               'opened per asset per year, by side. Analysis, not selection: picking by '
               'these is another layer of TEST peeking.')
 

@@ -102,25 +102,28 @@ def trend_bar_counts(ctx):
             'flat': int((lab == 0.0).sum())}
 
 
-def regime_winrate(x):
-    """Per-bar win rate of a return slice: the share of ACTIVE bars (|r| > 1e-9) that
-    gained. None under 30 bars in the regime (the same evidence floor as regime_sharpe)
-    or under 5 bars where the formula actually traded there."""
-    if x.size < 30:
+def call_accuracy(real, up):
+    """Accuracy of one side's calls. `real` holds the next-bar asset returns of every
+    (bar, asset) cell where the formula called that side — long cells for up=True,
+    short cells for up=False. A call is right when the price MOVED the called way;
+    a cell where it didn't move (|r| <= 1e-9) judges nothing. None under 30 calls
+    (the trend columns' evidence floor) or under 5 that moved."""
+    if real.size < 30:
         return None
-    a = np.abs(x) > 1e-9
+    a = np.abs(real) > 1e-9
     if int(a.sum()) < 5:
         return None
-    return float((x[a] > 0).mean())
+    r = real[a]
+    return float((r > 0).mean()) if up else float((r < 0).mean())
 
 
 def trade_stats(formula, ctx):
     """{long, short, long_yr, short_yr, win, wup, wdown, act, dd, cagr, sortino, tup,
     tdown, tflat} for one formula on TEST — act = trades per asset per year (relative
     activity, universe/period independent), long_yr/short_yr the same rate split by side;
-    dd/cagr/sortino from the same simulated TEST equity; tup/tdown/tflat = Sharpe and
-    wup/wdown = win rate by market DIRECTION regime (see trend_split / regime_winrate).
-    'err' if it doesn't parse or never trades."""
+    dd/cagr/sortino from the same simulated TEST equity; tup/tdown/tflat = Sharpe by
+    market DIRECTION regime (trend_split); wup/wdown = accuracy of the formula's own
+    long / short calls (call_accuracy). 'err' if it doesn't parse or never trades."""
     from genome import parse
     from evaluator import eval_alpha_panel
     from fastsim import fast_sim
@@ -154,8 +157,14 @@ def trade_stats(formula, ctx):
 
         lab = ctx['trend'][tmask]                                           # labels pre-lagged
         ts = trend_split(rt, lab, ctx['ann'])
-        wup = regime_winrate(rt[lab == 1])                                  # win rate when the
-        wdown = regime_winrate(rt[lab == -1])                               # market trends up/down
+        # WIN ↑ / WIN ↓ — accuracy of the formula's OWN calls, not the market's regime.
+        # The side held at the prior close is a per-asset call on THIS bar's move (the
+        # simulator books PnL the same way: units_prev × today's price change), so a
+        # long cell is right when the asset rose and a short cell when it fell.
+        pred = prev[tmask]
+        real = market['R'][tmask]
+        wup = call_accuracy(real[pred == 1], up=True)
+        wdown = call_accuracy(real[pred == -1], up=False)
 
         def _fin(v):                                                        # JSON-safe: NaN/inf -> null
             return float(v) if (v is not None and np.isfinite(v)) else None
