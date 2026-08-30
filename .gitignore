@@ -63,3 +63,9 @@ alphahub/hub.db
 deploy/.env
 deploy/hubdata/
 token_tokenovich
+
+# ── local build venv / installer output ──
+.venv-build/
+.venv*/
+venv*/
+packaging/Output/

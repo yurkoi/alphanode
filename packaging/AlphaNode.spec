@@ -149,7 +149,14 @@ _ico = os.path.join(SPECPATH, 'alphanode.ico')
 exe = EXE(
     pyz,
     a.scripts,
-    [],
+    # Python UTF-8 mode for the WHOLE frozen process: on a cp1251/… Windows every open() without
+    # an explicit encoding= otherwise writes/reads the ANSI codepage, and the first '▶'/'→' in a
+    # status/log file kills that role (json.dump of status.json did exactly this). Linux builds
+    # already run UTF-8 via the locale; this makes Windows behave the same. Explicit encoding=
+    # stays best practice — this is the safety net for the call nobody remembered.
+    [('X utf8=1', None, 'OPTION')],                  # CPython's -X utf8 (NOT 'utf8_mode' — that is
+    #                                                  the sys.flags name; a wrong key is silently
+    #                                                  ignored, which selfcheck now catches)
     exclude_binaries=True,
     name='AlphaNode',
     debug=False,

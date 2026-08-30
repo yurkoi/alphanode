@@ -92,7 +92,8 @@ def test_snapshot_manifest_and_secret_stripping(ws):
     assert 'state/library.jsonl' in names                # THE field bug: 1d must travel
     assert 'state/history.jsonl' in names
     assert man['alphas'] == {'1h': 3, '1d': 2}
-    assert man['forward'] == {'entries': 1, 'equity': 9950.0}   # archived entry not counted
+    assert 'state/forward.json' not in names             # the track is global: never inside
+    assert 'forward' not in man                          # …so the manifest has nothing to say
     assert 'state/favorites.json' in names               # stars travel with their session
     assert man['favorites'] == 2
     assert 'state/status.json' in names                  # …and so does the top of the board
@@ -632,7 +633,7 @@ def test_the_sessions_window_shows_the_id_column(gui_app):
     win.destroy()
 
 
-# ---- the forward track outlives sessions; the epoch id says who enrolled what ----------
+# ---- the forward track is GLOBAL — sessions never touch it; the epoch id says who enrolled what
 
 def _fwd(entries):
     return {'entries': entries}
@@ -646,45 +647,103 @@ def _e(eid, steps, **over):
     return d
 
 
-def test_a_session_load_merges_the_forward_track_instead_of_replacing_it(ws):
-    """The reported requirement: strategies keep stepping across session switches. Local
-    entries survive the load, the archive's entries JOIN them, and an entry present on both
-    sides keeps the longer (live) history — append-only means the shorter is a stale prefix."""
+def _repack_with(p, name, data):
+    """Rewrite archive `p` with one extra member — the way an archive from before the
+    global-track rule looks (it carried state/forward.json)."""
+    with tarfile.open(p) as tar:
+        members = {m.name: tar.extractfile(m).read() for m in tar.getmembers()}
+    members[name] = data
+    with tarfile.open(p, 'w:gz') as tar:
+        for n, d in members.items():
+            info = tarfile.TarInfo(n)
+            info.size = len(d)
+            tar.addfile(info, io.BytesIO(d))
+
+
+def test_snapshot_never_archives_the_forward_track(ws):
+    """The paper bots belong to the node, not to a session: a save carries no forward.json,
+    and stepping (which rewrites the file every bar) must not make a checkpoint look 'changed'."""
     state, settings = ws
-    json.dump(_fwd([_e('both01', 2), _e('arch01', 5)]),
-              open(os.path.join(state, 'forward.json'), 'w'))
+    p = S.snapshot(name='no-track', state_dir=state, settings_path=settings)
+    fp = S.workspace_fingerprint(state, settings)      # after the save minted session_id
+    with tarfile.open(p) as tar:
+        assert 'state/forward.json' not in {m.name for m in tar.getmembers()}
+    json.dump(_fwd([_e('stepped', 40)]), open(os.path.join(state, 'forward.json'), 'w'))
+    assert S.workspace_fingerprint(state, settings) == fp
+
+
+def test_restore_leaves_the_live_track_byte_identical(ws):
+    """Load swaps the library — and leaves the ledger alone, byte for byte."""
+    state, settings = ws
     p = S.snapshot(name='old', state_dir=state, settings_path=settings)
-    # life goes on after the save: 'both01' takes 3 more live steps, 'live01' is enrolled
-    json.dump(_fwd([_e('both01', 5), _e('live01', 1)]),
-              open(os.path.join(state, 'forward.json'), 'w'))
+    open(os.path.join(state, 'library_1h.jsonl'), 'w').write('{"f":99}\n')
+    fwd = os.path.join(state, 'forward.json')
+    json.dump(_fwd([_e('both01', 5), _e('live01', 1)]), open(fwd, 'w'))
+    before = open(fwd, 'rb').read()
     S.restore(p, state_dir=state, settings_path=settings)
-    got = json.load(open(os.path.join(state, 'forward.json')))['entries']
-    assert [e['id'] for e in got] == ['both01', 'live01', 'arch01']   # local first, then joins
-    assert len(next(e for e in got if e['id'] == 'both01')['history']) == 5   # live copy won
+    assert open(fwd, 'rb').read() == before
+    assert open(os.path.join(state, 'library_1h.jsonl')).read().count('\n') == 3   # swapped
 
 
-def test_loading_an_archive_with_no_forward_keeps_the_live_track(ws):
-    """Under the old wholesale swap this was the killer: an archive without forward.json
-    left the workspace with NO track at all — every running paper test gone."""
+def test_a_legacy_archive_with_a_forward_member_is_ignored_not_rejected(ws):
+    """Archives saved before the global-track rule carry state/forward.json: they must still
+    load (everything else restores), and that member must never land over the live file."""
     state, settings = ws
+    p = S.snapshot(name='legacy', state_dir=state, settings_path=settings)
+    foreign = json.dumps(_fwd([_e('deleted-long-ago', 50)])).encode()
+    _repack_with(p, 'state/forward.json', foreign)
+    fwd = os.path.join(state, 'forward.json')
+    json.dump(_fwd([_e('live01', 3)]), open(fwd, 'w'))
+    before = open(fwd, 'rb').read()
+    open(os.path.join(state, 'library_1h.jsonl'), 'w').write('{"f":99}\n')
+    S.restore(p, state_dir=state, settings_path=settings)          # must not raise
+    assert open(fwd, 'rb').read() == before                         # the ghost stays buried
+    assert open(os.path.join(state, 'library_1h.jsonl')).read().count('\n') == 3
+    assert not [n for n in os.listdir(S.sessions_dir(state)) if n.startswith('.undo-')]
+
+
+def test_restore_with_no_live_track_creates_none(ws):
+    """A legacy archive on a machine that has no track yet does not seed one either —
+    the rule is 'never written', not 'written only when absent'."""
+    state, settings = ws
+    p = S.snapshot(name='legacy', state_dir=state, settings_path=settings)
+    _repack_with(p, 'state/forward.json', json.dumps(_fwd([_e('x', 2)])).encode())
     os.remove(os.path.join(state, 'forward.json'))
-    p = S.snapshot(name='no-fwd', state_dir=state, settings_path=settings)
-    json.dump(_fwd([_e('live01', 3)]), open(os.path.join(state, 'forward.json'), 'w'))
     S.restore(p, state_dir=state, settings_path=settings)
-    got = json.load(open(os.path.join(state, 'forward.json')))['entries']
-    assert [e['id'] for e in got] == ['live01']
+    assert not os.path.exists(os.path.join(state, 'forward.json'))
 
 
-def test_the_archives_longer_history_wins_on_a_new_machine(ws):
-    """The same rule, mirrored: restore onto a machine whose copy is BEHIND (or empty) —
-    the archive's longer history is the live one there."""
+def test_manifest_no_longer_reports_forward_stats(ws):
     state, settings = ws
-    json.dump(_fwd([_e('both01', 7)]), open(os.path.join(state, 'forward.json'), 'w'))
-    p = S.snapshot(name='ahead', state_dir=state, settings_path=settings)
-    json.dump(_fwd([_e('both01', 2)]), open(os.path.join(state, 'forward.json'), 'w'))
-    S.restore(p, state_dir=state, settings_path=settings)
-    got = json.load(open(os.path.join(state, 'forward.json')))['entries']
-    assert len(got[0]['history']) == 7
+    S.snapshot(name='s1', state_dir=state, settings_path=settings)
+    assert 'forward' not in S.list_sessions(state)[0]
+
+
+def test_a_failed_restore_still_leaves_the_track_alone(ws, monkeypatch):
+    state, settings = ws
+    fwd = os.path.join(state, 'forward.json')
+    before = open(fwd, 'rb').read()
+    p = S.snapshot(name='boom', state_dir=state, settings_path=settings)
+    real = S.os.replace
+
+    def boom(src, dst):
+        if dst.endswith('library.jsonl'):
+            raise RuntimeError('disk boom')
+        return real(src, dst)
+    monkeypatch.setattr(S.os, 'replace', boom)
+    with pytest.raises(RuntimeError):
+        S.restore(p, state_dir=state, settings_path=settings)
+    assert open(fwd, 'rb').read() == before
+
+
+@pytest.mark.gui
+def test_sessions_rebuild_reruns_the_track_cleanup(gui_app):
+    app, _rec, _state = gui_app
+    app._fwd_migrated = True
+    app._sessions_rebuild()
+    assert app._fwd_migrated is False
+    app._fwd_lib()
+    assert app._fwd_migrated is True
 
 
 def test_current_session_id_is_minted_once_and_reset_deliberately(ws):
@@ -784,56 +843,6 @@ def test_the_forward_table_shows_each_entrys_session(gui_app):
 
 # ---- review findings, pinned -----------------------------------------------------------
 
-def test_same_id_but_a_different_strategy_never_displaces_the_live_entry(ws):
-    """An alpha's entry id is md5(formula)[:6] whatever the timeframe, universe or fees — an
-    old archive can carry a DIFFERENT enrollment under a live entry's id, with a longer
-    history. It must not win: only a copy of the SAME enrollment is the same append-only
-    stream. (Adversarial review finding.)"""
-    state, settings = ws
-    old = _e('aaaa01', 50, tf='1h', formulas=['tanh(low)'], enrolled='2026-01-01')
-    json.dump(_fwd([old]), open(os.path.join(state, 'forward.json'), 'w'))
-    p = S.snapshot(name='old-strategy', state_dir=state, settings_path=settings)
-    live = _e('aaaa01', 3, tf='1d', formulas=['tanh(low)'], enrolled='2026-08-20')
-    json.dump(_fwd([live]), open(os.path.join(state, 'forward.json'), 'w'))
-    S.restore(p, state_dir=state, settings_path=settings)
-    got = json.load(open(os.path.join(state, 'forward.json')))['entries']
-    assert len(got) == 1                                 # one row per id — the table's iid rule
-    assert got[0]['tf'] == '1d' and len(got[0]['history']) == 3   # the LIVE one, 50 steps or not
-
-
-def test_a_shape_corrupt_forward_file_degrades_instead_of_raising(ws):
-    """'entries': null is valid JSON that load_track happily passes through — the merge must
-    treat every corrupt shape as empty, the way the rest of the restore road does, because it
-    runs AFTER the swap and a TypeError there would make every later load fail identically.
-    (Adversarial review finding.)"""
-    state, settings = ws
-    p = S.snapshot(name='sane', state_dir=state, settings_path=settings)
-    open(os.path.join(state, 'forward.json'), 'w').write('{"entries": null}')
-    S.restore(p, state_dir=state, settings_path=settings)          # must not raise
-    got = json.load(open(os.path.join(state, 'forward.json')))['entries']
-    assert [e['id'] for e in got] == ['a', 'b']          # the archive's track, corrupt side empty
-    # …and a truthy non-list history must not crash len(): it counts as 0 steps, so the
-    # side with a WELL-FORMED history of the same enrollment wins
-    assert S._merge_forward({'entries': [{'id': 'x', 'history': 7}]},
-                            {'entries': [{'id': 'x', 'history': [1, 2]}]}) \
-        == {'entries': [{'id': 'x', 'history': [1, 2]}]}
-    assert S._merge_forward({'entries': 3}, {'entries': ['junk', {'id': 'y'}]}) \
-        == {'entries': [{'id': 'y'}]}
-
-
-def test_a_merge_failure_rolls_the_whole_workspace_back(ws, monkeypatch):
-    """The merge runs inside restore's transaction: if it blows up, the parked originals come
-    back byte-for-byte — including the live forward.json it was about to rewrite."""
-    state, settings = ws
-    before = open(os.path.join(state, 'forward.json')).read()
-    p = S.snapshot(name='boom', state_dir=state, settings_path=settings)
-    monkeypatch.setattr(S, '_merge_forward',
-                        lambda *_a: (_ for _ in ()).throw(RuntimeError('merge boom')))
-    with pytest.raises(RuntimeError):
-        S.restore(p, state_dir=state, settings_path=settings)
-    assert open(os.path.join(state, 'forward.json')).read() == before
-
-
 def test_an_explicit_session_stamp_wins_over_the_module_default(tmp_path, monkeypatch):
     """The GUI passes its own session id: with ALPHANODE_STATE_DIR exported, the module-level
     default could read a DIFFERENT directory's epoch than the header shows."""
@@ -842,3 +851,40 @@ def test_an_explicit_session_stamp_wins_over_the_module_default(tmp_path, monkey
     e = ft.new_entry('a', 'alpha', ['tanh(low)'], ['BTCUSDT'], 0.25, 0.001, '2024-01-01',
                      session='cafe01')
     assert e['session'] == 'cafe01'
+
+
+@pytest.mark.gui
+def test_a_running_forward_step_does_not_block_a_session_load(gui_app, monkeypatch):
+    """Load never touches the global track, so the stepper (which writes nothing else) is no
+    reason to refuse — the old 'Not now — a forward-track step is running' dialog is gone."""
+    import types
+    app, rec, state = gui_app
+    import alphanode_gui as G
+    S.snapshot(name='s', state_dir=str(state), settings_path=G.SETTINGS)
+    app._fwd_proc = types.SimpleNamespace(poll=lambda: None)   # a step in flight
+    seen = {}
+    monkeypatch.setattr(S, 'restore', lambda path, **k: (seen.setdefault('path', path), {})[1])
+    monkeypatch.setattr(app, '_sessions_rebuild', lambda: seen.setdefault('rebuilt', True))
+    yes = types.SimpleNamespace(askyesno=lambda *a, **k: True, showinfo=lambda *a, **k: None,
+                                showwarning=lambda *a, **k: rec.calls.append(('showwarning',) + a),
+                                showerror=lambda *a, **k: rec.calls.append(('showerror',) + a),
+                                askokcancel=lambda *a, **k: True)
+    monkeypatch.setattr(G, 'messagebox', yes)
+    app._sessions_open()
+    app.root.update()
+    win = [w for w in app.root.winfo_children()
+           if w.winfo_class() in ('Toplevel', 'CTkToplevel') and w.title() == 'Sessions'][-1]
+
+    def walk(w):
+        yield w
+        for kid in w.winfo_children():
+            yield from walk(kid)
+    tree = next(w for w in walk(win) if w.winfo_class() == 'Treeview')
+    tree.selection_set(tree.get_children()[0])
+    import customtkinter as ctk
+    btn = next(w for w in walk(win) if isinstance(w, ctk.CTkButton)
+               and w.cget('text') == 'Load selected')
+    btn.invoke()
+    assert seen.get('path', '').endswith('.tar.gz') and seen.get('rebuilt')
+    assert not [c for c in rec.calls if c[0] == 'showerror' or 'Not now' in str(c)]
+    assert app._test_tk_errors == []

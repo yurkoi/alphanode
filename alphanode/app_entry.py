@@ -253,8 +253,10 @@ def _selfcheck_body(out):
 
 def main():
     import multiprocessing
+    _fix_std_streams()                                   # BEFORE freeze_support: pool workers never
+    # return from it, and with sys.stderr = None (windowed exe) a dying worker's traceback print
+    # raises 'NoneType has no write' -> PyInstaller error dialog per worker on a hard node stop
     multiprocessing.freeze_support()                     # portfolio build uses a process pool
-    _fix_std_streams()
     if os.environ.get('ALPHANODE_HANG_DUMP'):
         # CI forensics for a wedged frozen process: a windowed exe on Windows has no visible
         # stdout/stderr, so a hang is 900 silent seconds. Arm faulthandler to dump EVERY

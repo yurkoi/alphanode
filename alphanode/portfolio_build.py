@@ -101,20 +101,29 @@ _G = {}
 
 
 def _winit(sim_start, sim_end):
-    from config import load_config
-    from evaluator import load_raw
-    cfg = load_config()
-    # workers only run the engine on the RAW dfs — skip build_panel's wide feature tables
-    # (11 x N x days), which _sim_one never touches, to save per-worker memory + startup CPU.
-    tk, raw = load_raw(cfg['data'], cfg.get('instruments'))
+    # A raising initializer makes mp.Pool respawn the worker forever (crash-dialog loop in the
+    # windowed build) — record the error and fail fast on the first task instead.
+    try:
+        from config import load_config
+        from evaluator import load_raw
+        cfg = load_config()
+        # workers only run the engine on the RAW dfs — skip build_panel's wide feature tables
+        # (11 x N x days), which _sim_one never touches, to save per-worker memory + startup CPU.
+        tk, raw = load_raw(cfg['data'], cfg.get('instruments'))
+        _G.update(cfg=cfg, tk=tk, raw=raw, start=sim_start, end=sim_end)
+    except Exception as e:                                # noqa: BLE001
+        _G['init_error'] = e
+        return
     try:
         os.nice(10)                                       # background priority: keep the GUI responsive
     except (AttributeError, OSError):
         pass
-    _G.update(cfg=cfg, tk=tk, raw=raw, start=sim_start, end=sim_end)
 
 
 def _sim_one(arg):
+    if 'init_error' in _G:
+        raise RuntimeError(f'worker init failed: {type(_G["init_error"]).__name__}: '
+                           f'{_G["init_error"]}')
     i, formula = arg
     from evolved_strategy import make_evolved
     tk, raw = _G['tk'], _G['raw']

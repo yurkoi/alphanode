@@ -58,15 +58,27 @@ def load_raw(data_path, instruments=None):
     building the wide feature panel. For callers that need just the raw dfs (e.g. the real-engine
     portfolio workers), avoiding the panel's memory/CPU cost.
 
-    instruments=None -> all pairs; a list -> keep only those, in that order."""
+    instruments=None -> all pairs; a list -> keep only those, in that order.
+
+    A requested pair the snapshot lacks is DROPPED with a warning, not an error: top-N-by-turnover
+    universes shift between fetches (a pair falls out of the ranking), and raising here used to
+    kill every pool worker's initializer — mp.Pool respawns such workers forever, so one stale
+    ticker turned into an endless crash-dialog loop and a hung round. Only an entirely unknown
+    universe still raises."""
     with open(data_path, 'rb') as f:
         tk, oh = pickle.load(f)
     if instruments:
         pos = {t: i for i, t in enumerate(tk)}
         missing = [t for t in instruments if t not in pos]
         if missing:
-            raise ValueError(f'no data for {missing} in {os.path.basename(data_path)}. '
-                             f'Available: {tk}. New pairs need to be downloaded.')
+            keep = [t for t in instruments if t in pos]
+            if not keep:
+                raise ValueError(f'no data for {missing} in {os.path.basename(data_path)}. '
+                                 f'Available: {tk}. New pairs need to be downloaded.')
+            print(f'WARNING: no data for {", ".join(missing)} in {os.path.basename(data_path)} '
+                  f'(the snapshot was refreshed and the ranking shifted?) — continuing on the '
+                  f'{len(keep)} remaining pairs; re-download data to include them', flush=True)
+            instruments = keep
         oh = [oh[pos[t]] for t in instruments]
         tk = list(instruments)
     return tk, {t: oh[i] for i, t in enumerate(tk)}

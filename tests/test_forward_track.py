@@ -362,3 +362,96 @@ def test_new_entry_stamps_the_current_session(tmp_path, monkeypatch):
     S.begin_new_session(str(tmp_path))
     e2 = ft.new_entry('b', 'alpha', [FORMULA], ['ETHUSDT'], 0.25, 0.001, '2024-01-01')
     assert e2['session'] != sid and e['session'] == sid
+
+
+# ------------------------------------------------- Part D: one id, one entry (BUG_FIXES 2026-08-25)
+
+def test_sync_prefers_active_copy_when_id_is_doubled(sandbox):
+    """A shipped loop: the track carried an ARCHIVED copy and a live re-enrollment of the
+    same portfolio under one id (name_sig is deterministic; an old Archive button left the
+    ghost). sync_entry_to_disk matched the ghost first -> 'archived mid-step — dropped' on
+    every tick, and the live entry never advanced. The active copy must win; the ghost stays
+    untouched."""
+    e1, _ = _enroll_two()
+    ghost = json.loads(json.dumps(e1))
+    ghost['archived'] = True
+    track = ft.load_track()
+    track['entries'].insert(0, ghost)                    # the ghost sits BEFORE the live copy
+    ft.save_track(track)
+
+    stepped = json.loads(json.dumps(e1))                 # the stepper's copy, one bar later
+    stepped['state']['equity'] = 12345.0
+    stepped['history'].append({'date': '2026-08-25', 'equity': 12345.0})
+    assert ft.sync_entry_to_disk(stepped) is True
+
+    copies = [x for x in ft.load_track()['entries'] if x['id'] == e1['id']]
+    live = [x for x in copies if not x['archived']]
+    assert len(copies) == 2 and len(live) == 1
+    assert live[0]['state']['equity'] == 12345.0 and len(live[0]['history']) == 1
+    arch = next(x for x in copies if x['archived'])
+    assert arch['history'] == [] and arch['state']['equity'] == ft.START_CAPITAL
+    assert ft.find_entry(ft.load_track(), e1['id'])['archived'] is False
+
+
+def test_unique_id_steps_around_ghosts():
+    track = {'entries': [{'id': 'portfolio_top6_da7dbf', 'archived': True},
+                         {'id': 'portfolio_top6_da7dbf-2', 'archived': True}]}
+    assert ft.unique_id(track, 'portfolio_top6_da7dbf') == 'portfolio_top6_da7dbf-3'
+    assert ft.unique_id(track, 'fresh') == 'fresh'
+    assert ft.unique_id({'entries': []}, 'x') == 'x'
+
+
+def test_drop_ghosts_cures_a_poisoned_file_and_spares_honest_archives():
+    """The cure for a track already carrying the doubled id: the archived copy shadowed by a
+    live entry goes; an archived entry nobody re-enrolled is history and stays."""
+    live = {'id': 'portfolio_top6_da7dbf', 'archived': False, 'history': [1, 2, 3]}
+    ghost = {'id': 'portfolio_top6_da7dbf', 'archived': True, 'history': [1]}
+    honest = {'id': 'f2adc1', 'archived': True, 'history': [1, 2]}
+    track = {'entries': [ghost, live, honest]}
+    assert ft.drop_ghosts(track) == 1
+    assert track['entries'] == [live, honest]
+    assert ft.drop_ghosts(track) == 0                    # idempotent
+    assert ft.drop_ghosts({'entries': []}) == 0
+
+
+@pytest.mark.gui
+def test_gui_reenroll_over_archived_ghost_gets_a_fresh_id(gui_app):
+    """The shipped stepper loop: a portfolio archived by an old build stays on disk under its
+    deterministic name_sig id; enrolling the same portfolio again must NOT reuse that id —
+    the stepper syncs by id and landed every step on the ghost (dropped as 'archived')."""
+    app, rec, state = gui_app
+    forms = [FORMULA, FORMULA + '#2']
+    app._fwd_enroll(forms, 'portfolio_top2', 'portfolio')
+    track = ft.load_track()
+    assert len(track['entries']) == 1
+    ghost_id = track['entries'][0]['id']
+    track['entries'][0]['archived'] = True               # what the old Archive button left
+    ft.save_track(track)
+
+    app._fwd_enroll(forms, 'portfolio_top2', 'portfolio')   # find_duplicate ignores the ghost
+    entries = ft.load_track()['entries']
+    assert len(entries) == 2 and len({e['id'] for e in entries}) == 2
+    live = next(e for e in entries if not e['archived'])
+    assert live['id'] == ghost_id + '-2'
+    stepped = json.loads(json.dumps(live))
+    stepped['state']['equity'] = 1.0
+    assert ft.sync_entry_to_disk(stepped) is True        # lands on the live entry, not the ghost
+    assert next(e for e in ft.load_track()['entries'] if e['archived'])['state']['equity'] \
+        == ft.START_CAPITAL
+    assert app._test_tk_errors == []
+
+
+@pytest.mark.gui
+def test_gui_opening_the_track_drops_ghosts_once(gui_app):
+    """A file poisoned before the fix is cured the first time the GUI touches the track."""
+    app, _rec, state = gui_app
+    live = ft.new_entry('portfolio_top6', 'portfolio', [FORMULA, FORMULA + '#2'], ['BTCUSDT'],
+                        0.25, 0.001, '2024-01-01')
+    ghost = json.loads(json.dumps(live))
+    ghost['archived'] = True
+    (state / 'forward.json').write_text(json.dumps({'entries': [ghost, live]}))
+    app._fwd_migrated = False
+    app._fwd_lib()
+    got = ft.load_track()['entries']
+    assert [e['archived'] for e in got] == [False]
+    assert got[0]['id'] == live['id']

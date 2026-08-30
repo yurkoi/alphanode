@@ -129,6 +129,47 @@ def migrate_ids(track):
     return n
 
 
+def find_entry(track, entry_id):
+    """The entry carrying `entry_id` — the ACTIVE copy when the id is doubled up. A track can
+    hold an archived copy AND a live re-enrollment under one id (portfolio ids are the
+    deterministic name_sig; the old Archive button left the ghost behind), and 'first match
+    wins' pinned the stepper to the ghost: every tick computed the step, sync dropped it as
+    'archived mid-step', the live entry never advanced — a 2-minute loop every 5 minutes."""
+    hit = None
+    for e in track.get('entries', []):
+        if e.get('id') == entry_id:
+            if not e.get('archived'):
+                return e
+            hit = hit or e
+    return hit
+
+
+def unique_id(track, base):
+    """`base` if no entry — archived or not — carries it, else base-2, base-3, …  An id
+    must be unique across the WHOLE file: the stepper syncs its results by id."""
+    ids = {e.get('id') for e in track.get('entries', [])}
+    if base not in ids:
+        return base
+    n = 2
+    while f'{base}-{n}' in ids:
+        n += 1
+    return f'{base}-{n}'
+
+
+def drop_ghosts(track):
+    """One-time cure for a file already poisoned by the doubled-id bug (see find_entry):
+    an ARCHIVED copy whose id is also carried by an active entry is a ghost — it holds a
+    stale prefix of the same stream and nothing can ever address it. Returns how many
+    were dropped; the caller saves."""
+    live = {e.get('id') for e in track.get('entries', []) if not e.get('archived')}
+    keep = [e for e in track.get('entries', [])
+            if not (e.get('archived') and e.get('id') in live)]
+    n = len(track.get('entries', [])) - len(keep)
+    if n:
+        track['entries'] = keep
+    return n
+
+
 def find_duplicate(track, formulas, tickers, tf='1d'):
     """An ACTIVE entry with the same frozen strategy (formulas + universe + bar size)."""
     key = ('|'.join(formulas), ','.join(sorted(tickers)), tf)
@@ -410,17 +451,18 @@ def sync_entry_to_disk(entry):
     one-way `archived` flag above all, or the entry's very existence — belongs to the
     freshest disk copy. Returns True if the step result was persisted."""
     disk = load_track()
-    for i, e in enumerate(disk['entries']):
-        if e.get('id') == entry.get('id'):
-            if e.get('archived'):
-                return False                             # archived mid-step: the click wins
-            merged = dict(e)                             # disk copy keeps structural edits
-            merged['state'] = entry['state']
-            merged['history'] = entry['history']
-            disk['entries'][i] = merged
-            save_track(disk)
-            return True
-    return False                                         # removed on disk mid-step: stays gone
+    e = find_entry(disk, entry.get('id'))                # the ACTIVE copy if the id is doubled
+    if e is None:
+        return False                                     # removed on disk mid-step: stays gone
+    if e.get('archived'):
+        return False                                     # archived mid-step: the click wins
+    merged = dict(e)                                     # disk copy keeps structural edits
+    merged['state'] = entry['state']
+    merged['history'] = entry['history']
+    i = next(i for i, x in enumerate(disk['entries']) if x is e)
+    disk['entries'][i] = merged
+    save_track(disk)
+    return True
 
 
 def step_all(force=False, log=print):
@@ -435,7 +477,7 @@ def step_all(force=False, log=print):
         try:
             # an Archive click may land while EARLIER entries were stepping — re-check the
             # disk before spending minutes fetching klines for an entry nobody wants stepped
-            fresh = {x.get('id'): x for x in load_track()['entries']}.get(e['id'])
+            fresh = find_entry(load_track(), e['id'])
             if fresh is None or fresh.get('archived'):
                 log(f'[{e["id"]}] archived/removed while the pass ran — skipped')
                 continue

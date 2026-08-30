@@ -11,8 +11,10 @@ customtkinter     # the GUI toolkit. NOT optional: alphanode_gui imports it at m
                   # Its assets (themes/*.json, fonts) are data files — pyinstaller-hooks-contrib
                   # ships hook-customtkinter.py, which collects them; --role selfcheck proves it.
 darkdetect        # customtkinter dep: reads the OS light/dark preference for the first run
-matplotlib>=3.6
+matplotlib>=3.6,<3.11  # 3.11.1 wheel landed without widgets.py on 2026-08-29: backend_bases died at import; stay on the validated 3.10 line
 requests          # quantpylib.throttler.aiosonic imports requests
+cryptography      # vault.py (formula sealing: x25519 + ChaCha20Poly1305) — node.py imports it
+                  # whenever the shipped vault_server_key.pub exists, i.e. in every real build
 aiosonic==0.31.1  # quantpylib is verified on 0.31.x (the API changed in 1.x)
 orjson
 onecache

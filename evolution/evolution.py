@@ -32,13 +32,23 @@ def fit_cfg(cfg):
 
 def _winit(data, start, end, splits, vol, exec_rate, instruments, freq, vol_window, ann,
            ewma_lambda, fit):
-    tk, raw, panel = build_panel(data, start, end, instruments, freq=freq)
-    _G.update(tk=tk, panel=panel, market=make_market(panel, tk, raw, vol_window=vol_window),
-              splits=splits, vol=vol, exec=exec_rate, ann=ann, ewma_lambda=ewma_lambda,
-              fit=fit)
+    # Never let the initializer raise: mp.Pool respawns a worker whose initializer died, forever —
+    # one bad snapshot/universe becomes an endless crash loop (and a dialog storm in the windowed
+    # build). Keep the worker alive and fail fast on the first task instead — that propagates as
+    # ONE clean exception through pool.map to the parent, which already handles a failed round.
+    try:
+        tk, raw, panel = build_panel(data, start, end, instruments, freq=freq)
+        _G.update(tk=tk, panel=panel, market=make_market(panel, tk, raw, vol_window=vol_window),
+                  splits=splits, vol=vol, exec=exec_rate, ann=ann, ewma_lambda=ewma_lambda,
+                  fit=fit)
+    except Exception as e:                               # noqa: BLE001
+        _G['init_error'] = e
 
 
 def _weval(node):
+    if 'init_error' in _G:
+        raise RuntimeError(f'worker init failed: {type(_G["init_error"]).__name__}: '
+                           f'{_G["init_error"]}')
     return evaluate(node, _G['tk'], _G['panel'], _G['market'], _G['splits'], _G['vol'], _G['exec'],
                     ann=_G['ann'], ewma_lambda=_G['ewma_lambda'], fit=_G['fit'])
 

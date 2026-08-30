@@ -40,25 +40,34 @@ _G = {}
 
 
 def _winit():
-    from config import load_config
-    from evaluator import build_panel, make_market
-    cfg = load_config()                                  # timeframe fields honor ALPHANODE_TF
-    uni = os.environ.get('ALPHANODE_UNIVERSE', 'all')
-    if uni.lower() not in ('all', '*', ''):
-        cfg['instruments'] = [x.strip().upper() for x in uni.split(',') if x.strip()]
-    tk, raw, panel = build_panel(cfg['data'], cfg['start'], cfg['end'], cfg.get('instruments'),
-                                 freq=cfg.get('freq', 'D'))
+    # A raising initializer makes mp.Pool respawn the worker forever (crash-dialog loop in the
+    # windowed build) — record the error and fail fast on the first task instead.
+    try:
+        from config import load_config
+        from evaluator import build_panel, make_market
+        cfg = load_config()                              # timeframe fields honor ALPHANODE_TF
+        uni = os.environ.get('ALPHANODE_UNIVERSE', 'all')
+        if uni.lower() not in ('all', '*', ''):
+            cfg['instruments'] = [x.strip().upper() for x in uni.split(',') if x.strip()]
+        tk, raw, panel = build_panel(cfg['data'], cfg['start'], cfg['end'], cfg.get('instruments'),
+                                     freq=cfg.get('freq', 'D'))
+        _G.update(cfg=cfg, tk=tk, panel=panel,
+                  market=make_market(panel, tk, raw, vol_window=cfg.get('vol_window', 30)))
+    except Exception as e:                               # noqa: BLE001
+        _G['init_error'] = e
+        return
     try:
         os.nice(10)
     except (AttributeError, OSError):
         pass
-    _G.update(cfg=cfg, tk=tk, panel=panel,
-              market=make_market(panel, tk, raw, vol_window=cfg.get('vol_window', 30)))
 
 
 def _rescore_one(row):
     from genome import parse
     from evaluator import evaluate
+    if 'init_error' in _G:
+        raise RuntimeError(f'worker init failed: {type(_G["init_error"]).__name__}: '
+                           f'{_G["init_error"]}')
     cfg = _G['cfg']
     try:
         met = (row.get('fit_metric') or 'sharpe').strip().lower()

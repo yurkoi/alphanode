@@ -2,12 +2,13 @@
 
 A session is a tar.gz snapshot of everything a user would call "my setup": the sealed
 formula libraries (every timeframe, including the suffixless daily files), round history,
-the forward track, the built portfolio and the app settings — plus a manifest that lets a
-list of sessions read like a story (when, what timeframes, how many alphas, what the
-paper equity was). Market data is NOT included (re-fetchable, heavy), neither are machine
-identity files (device_id/node_id), nor the subscription key: a session may travel to
-another machine or another person, and the licence must never ride along (SECRET_KEYS is
-stripped on save and preserved on restore).
+the built portfolio, the ★ favorites and the app settings — plus a manifest that lets a
+list of sessions read like a story (when, what timeframes, how many alphas). Market data
+is NOT included (re-fetchable, heavy), neither are machine identity files
+(device_id/node_id), nor the subscription key: a session may travel to another machine or
+another person, and the licence must never ride along (SECRET_KEYS is stripped on save and
+preserved on restore). The FORWARD TRACK is not part of a session either: it is one
+global, append-only ledger per node that every session shares (see the note below).
 
 Safety model, in the order things can go wrong:
   * snapshots are written to a .partial file and os.replace()d into place — a crash or
@@ -25,10 +26,9 @@ Safety model, in the order things can go wrong:
     absolute paths, ../, links, FIFOs/devices and oversized archives are rejected
     before a single byte lands in the workspace.
 
-Honesty note: restoring an older session does NOT rewind the forward track's clock —
-stepping resumes from the next closed bar and the gap stays visible in history, exactly
-like a laptop that was simply off (mark-to-market covers the missed bars on the next
-step). Nothing is ever re-computed backwards.
+Honesty note: sessions never touch the forward track's clock — loading one changes the
+library, the portfolio and the counters, while the paper bots keep stepping on the same
+global ledger as if nothing happened. Nothing is ever re-computed backwards.
 """
 import hashlib
 import io
@@ -49,11 +49,13 @@ from version import __version__
 # The timeframe suffix is OPTIONAL: daily files are plain library.jsonl / history.jsonl.
 _STATE_PATTERNS = (re.compile(r'^library(_[A-Za-z0-9]+)?\.jsonl$'),
                    re.compile(r'^history(_[A-Za-z0-9]+)?\.jsonl$'),
-                   re.compile(r'^forward\.json$'),
                    re.compile(r'^portfolio\.json$'),
                    re.compile(r'^favorites\.json$'),
                    re.compile(r'^status\.json$'),
                    re.compile(r'^session_id$'))
+# members an OLDER archive may carry that the workspace no longer owns: skipped on restore —
+# never extracted, never written over the live file (forward.json — see the note below)
+_LEGACY_SKIP = (re.compile(r'^forward\.json$'),)
 # favorites.json is session-owned. A star points at a formula in the library,
 # and it used to outlive the library it pointed into: load a different workspace and the
 # ★ list still held rows mined on another basket, another cut, sometimes another timeframe.
@@ -79,15 +81,16 @@ _STATE_PATTERNS = (re.compile(r'^library(_[A-Za-z0-9]+)?\.jsonl$'),
 # archive (this file is owned, so the swap adopts the archive's epoch; an archive from before
 # epochs carries none, and the next current_session_id() call honestly mints a fresh one).
 # Reopening the app or pressing Start again is NOT a new session — it continues the same work.
-# Forward-track entries stamp this id at enrollment, which is what makes them traceable once
-# the track outlives the session that enrolled them (see the forward.json note below).
+# Forward-track entries stamp this id at enrollment, which is what says where each came
+# from once many sessions have enrolled into the one shared track.
 #
-# forward.json is the exception to restore's wholesale-swap rule: it is ARCHIVED on save (a
-# session that travels carries its paper history) but MERGED on load, never replaced. The
-# track is a live, append-only ledger — its steps happen in real time and can never be
-# recomputed — so loading a session must not kill the strategies currently stepping. Entries
-# are united by id; an id present on both sides keeps the copy with the LONGER history
-# (append-only means the longer one contains the shorter — the shorter is a stale prefix).
+# forward.json is GLOBAL — deliberately NOT in _STATE_PATTERNS. The track is a live,
+# append-only ledger whose steps happen in real time and can never be recomputed; it belongs
+# to the node, not to a session. So it is neither archived on save nor parked, swapped or
+# merged on load, and it does not enter the workspace fingerprint. Archives written before
+# this rule still carry a state/forward.json member: _safe_members skips it (never extracted).
+# Paper bots therefore survive every Save / Load / Clear-all-history untouched, and a deleted
+# bot stays deleted — no older archive can bring it back.
 SECRET_KEYS = ('vault_license',)                         # never inside an archive
 
 MAX_MEMBERS = 64                                         # a snapshot writes ~a dozen
@@ -207,53 +210,6 @@ def begin_new_session(state_dir=None):
     return current_session_id(state_dir)
 
 
-def _fwd_entries(src):
-    """The entry dicts of one track side — [] for every corrupt shape ('entries': null, a
-    number, a list of strings): a merge must degrade the way every other corrupt-input path
-    on the restore road does, never TypeError after the swap already happened."""
-    e = src.get('entries') if isinstance(src, dict) else None
-    return [x for x in e if isinstance(x, dict)] if isinstance(e, list) else []
-
-
-def _hist_len(e):
-    h = e.get('history')
-    return len(h) if isinstance(h, list) else 0
-
-
-def _same_enrollment(a, b):
-    """Same FROZEN strategy, enrolled the same day — only then are two histories the same
-    append-only stream and comparable by length."""
-    return all(a.get(k) == b.get(k) for k in
-               ('formulas', 'tickers', 'tf', 'vol', 'exec', 'enrolled', 'start_capital'))
-
-
-def _merge_forward(local, incoming):
-    """Union of two forward tracks by entry id — restore's merge (see the note atop the
-    module). Local entries keep their positions (they are what the user watches every day);
-    the archive's own entries follow. None if there is nothing on either side.
-
-    Same id does NOT mean same strategy: an alpha's entry id is md5(formula)[:6] whatever
-    the timeframe, universe or fees, so an old archive can carry a DIFFERENT enrollment
-    under a live entry's id. Only a copy of the SAME enrollment may replace the live one —
-    and only by being further along its append-only history. Anything else keeps the live
-    entry: a load must never displace what is stepping."""
-    if not (isinstance(local, dict) or isinstance(incoming, dict)):
-        return None
-    by_id, order = {}, []
-    for e in _fwd_entries(local):
-        eid = str(e.get('id'))
-        if eid not in by_id:
-            by_id[eid] = e
-            order.append(eid)
-    for e in _fwd_entries(incoming):
-        eid = str(e.get('id'))
-        if eid not in by_id:
-            by_id[eid] = e
-            order.append(eid)
-        elif _same_enrollment(by_id[eid], e) and _hist_len(e) > _hist_len(by_id[eid]):
-            by_id[eid] = e                               # the longer copy of the SAME stream
-    return {'entries': [by_id[i] for i in order]}
-
 
 def build_manifest(name, note, auto, state_dir, settings_path, sid=''):
     alphas = {}
@@ -265,15 +221,6 @@ def build_manifest(name, note, auto, state_dir, settings_path, sid=''):
                 alphas[tf] = sum(1 for line in open(f, encoding='utf-8') if line.strip())
             except OSError:
                 alphas[tf] = 0
-    fwd = {'entries': 0, 'equity': None}
-    try:
-        t = json.load(open(os.path.join(state_dir, 'forward.json'), encoding='utf-8'))
-        act = [e for e in t.get('entries', []) if not e.get('archived')]
-        fwd['entries'] = len(act)
-        eqs = [float(e.get('state', {}).get('equity', 0)) for e in act]
-        fwd['equity'] = round(sum(eqs), 2) if eqs else None
-    except Exception:                                    # noqa: BLE001
-        pass
     try:
         doc = json.load(open(os.path.join(state_dir, 'favorites.json'), encoding='utf-8'))
         favs = sum(1 for f in doc.get('favorites', []) if isinstance(f, dict) and f.get('formula'))
@@ -289,7 +236,7 @@ def build_manifest(name, note, auto, state_dir, settings_path, sid=''):
     return {'id': sid, 'session': current_session_id(state_dir),
             'name': name or '', 'note': note or '', 'auto': bool(auto),
             'created': datetime.now(timezone.utc).isoformat(timespec='seconds'),
-            'version': __version__, 'alphas': alphas, 'forward': fwd, 'favorites': favs,
+            'version': __version__, 'alphas': alphas, 'favorites': favs,
             'run': run, 'fp': workspace_fingerprint(state_dir, settings_path)}
 
 
@@ -434,6 +381,8 @@ def _safe_members(tar):
             ok.append(m)
             continue
         b = os.path.basename(n)
+        if n == 'state/' + b and any(p.match(b) for p in _LEGACY_SKIP):
+            continue                                     # pre-global-track archive: ignored
         if n == 'state/' + b and any(p.match(b) for p in _STATE_PATTERNS):
             ok.append(m)
             continue
@@ -483,11 +432,6 @@ def restore(path, state_dir=None, settings_path=None, backup=False):
             # a mid-swap failure puts every one of them back
             undo = tempfile.mkdtemp(prefix='.undo-', dir=sessions_dir(state_dir))
             parked = []                                  # (parked_path, original_path)
-            fwd_path = os.path.join(state_dir, 'forward.json')
-            try:                                         # the live ledger, BEFORE it is parked
-                local_fwd = json.load(open(fwd_path, encoding='utf-8'))
-            except Exception:                            # noqa: BLE001 — none yet / unreadable
-                local_fwd = None
             try:
                 for f in _owned_state_files(state_dir):
                     b = os.path.join(undo, os.path.basename(f))
@@ -497,19 +441,8 @@ def restore(path, state_dir=None, settings_path=None, backup=False):
                 if os.path.isdir(src_state):
                     for b in sorted(os.listdir(src_state)):
                         os.replace(os.path.join(src_state, b), os.path.join(state_dir, b))
-                # forward.json: MERGE, not swap. The track is live and append-only — a load
-                # must not kill the strategies currently stepping (see the module note).
-                try:
-                    incoming_fwd = json.load(open(fwd_path, encoding='utf-8'))
-                except Exception:                        # noqa: BLE001 — archive carried none
-                    incoming_fwd = None
-                merged = _merge_forward(local_fwd, incoming_fwd)
-                if merged is not None:                   # tmp + replace, like save_track: a
-                    mfd, mtmp = tempfile.mkstemp(         # SIGKILL mid-write must never leave
-                        dir=state_dir, prefix='.fwd-merge-')   # the live ledger torn
-                    with os.fdopen(mfd, 'w', encoding='utf-8') as fh:
-                        json.dump(merged, fh, ensure_ascii=False)
-                    os.replace(mtmp, fwd_path)
+                # forward.json is global: not owned, so never parked above, and the archive's
+                # copy (if an old one carries it) was skipped by _safe_members — untouched
             except BaseException:
                 for f in _owned_state_files(state_dir):  # anything already placed is new
                     try:

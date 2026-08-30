@@ -2,7 +2,7 @@
 ;   iscc packaging\AlphaNode.iss   ->  packaging\Output\AlphaNode-Setup.exe
 ; Expects the built PyInstaller folder packaging\dist\AlphaNode\ and alphanode.ico alongside it.
 #define MyAppName "AlphaNode"
-#define MyAppVersion "1.4.3"
+#define MyAppVersion "2.0.0"
 #define MyAppPublisher "AlphaNode"
 #define MyAppExeName "AlphaNode.exe"
 
@@ -17,7 +17,7 @@ DisableProgramGroupPage=yes
 ; show the EULA and require acceptance before install (the repo-root LICENSE.txt, also bundled)
 LicenseFile=..\LICENSE.txt
 OutputDir=Output
-OutputBaseFilename=AlphaNode-Setup
+OutputBaseFilename=AlphaNode-Setup-2.0v
 SetupIconFile=alphanode.ico
 Compression=lzma2
 SolidCompression=yes

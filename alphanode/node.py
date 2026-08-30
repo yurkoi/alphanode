@@ -77,14 +77,14 @@ def _resolve_seed():
     integer keeps the old fully reproducible behavior. Returns (seed, node_id, is_auto)."""
     nid_path = os.path.join(STATE_DIR, 'node_id')
     try:
-        nid = open(nid_path).read().strip().lower()
+        nid = open(nid_path, encoding='utf-8').read().strip().lower()
     except OSError:
         nid = ''
     if not (len(nid) == 8 and all(c in '0123456789abcdef' for c in nid)):
         import secrets
         nid = secrets.token_hex(4)
         try:
-            with open(nid_path, 'w') as f:
+            with open(nid_path, 'w', encoding='utf-8') as f:
                 f.write(nid + '\n')
         except OSError:
             pass
@@ -265,7 +265,9 @@ status = {'app': 'AlphaNode', 'state': 'starting', 'started': iso(), 'updated': 
 def save_status():
     status['updated'] = iso()
     try:
-        with open(STATUS_FILE, 'w') as f:
+        # encoding is EXPLICIT: events carry '▶'/'★', and the locale default (cp1251 on a Russian
+        # Windows) can't encode them — the node died right after 'Start node' on such machines.
+        with open(STATUS_FILE, 'w', encoding='utf-8') as f:
             json.dump(status, f, indent=2, ensure_ascii=False, default=str)
     except OSError:
         pass

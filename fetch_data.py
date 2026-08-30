@@ -484,6 +484,14 @@ def run(out_path, interval='1d', symbols=None, top=150, min_years=3.0, start=Non
 
 
 def main():
+    # Progress lines below use '→'/'✓'; on a cp1251/… Windows console or pipe the default stream
+    # encoding can't represent them and print() raises UnicodeEncodeError — never crash over
+    # cosmetics. (The frozen app and the GUI already force UTF-8; this covers bare CLI runs.)
+    for _s in (sys.stdout, sys.stderr):
+        try:
+            _s.reconfigure(errors='replace')
+        except (AttributeError, OSError, ValueError):
+            pass
     ap = argparse.ArgumentParser(description='Download top-N USDT perps (with history >= N years) from Binance')
     ap.add_argument('--top', type=int, default=150, help='how many pairs (top by 24h turnover)')
     ap.add_argument('--min-years', type=float, default=3.0, help='minimum years of history (by listing date)')

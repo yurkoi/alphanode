@@ -97,7 +97,7 @@ def compute_targets(tickers, dfs, end):
 
 def load_state():
     if os.path.exists(STATE_FILE):
-        with open(STATE_FILE) as f:
+        with open(STATE_FILE, encoding='utf-8') as f:
             state = json.load(f)
         dd = {}                                    # дедуп истории по дате (чистим прежние повторы)
         for h in state.get('history', []):
@@ -109,13 +109,13 @@ def load_state():
 
 
 def save_state(state):
-    with open(STATE_FILE, 'w') as f:
+    with open(STATE_FILE, 'w', encoding='utf-8') as f:
         json.dump(state, f, indent=2)
 
 
 def log_trades(date, trades, prices):
     new = not os.path.exists(TRADES_LOG)
-    with open(TRADES_LOG, 'a') as f:
+    with open(TRADES_LOG, 'a', encoding='utf-8') as f:
         if new:
             f.write('date,ticker,side,units,notional_usd\n')
         for t, d in trades.items():
