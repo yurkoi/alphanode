@@ -428,6 +428,8 @@ def _apply_overrides(cfg):
     _override(cfg, 'corr_penalty', 'CORR_PENALTY', float)
     _override(cfg, 'hof_cap', 'HOF_CAPACITY', int)
     _override(cfg, 'fit_blocks', 'FIT_BLOCKS', int)    # robust fitness; 0 = legacy min(train,val)
+    _override(cfg, 'fit_net_penalty', 'FIT_NET_PENALTY', float)   # one-sided-book guard
+    _override(cfg, 'fit_max_net', 'FIT_MAX_NET', float)
     _override(cfg, 'fit_metric', 'FIT_METRIC',         # 'sharpe' | 'winrate'
               lambda s: s.strip().lower())
     _apply_segments(cfg)

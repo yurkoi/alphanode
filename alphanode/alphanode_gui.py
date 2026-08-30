@@ -1821,7 +1821,7 @@ class App:
         wrap.pack(fill='both', expand=True)
         self._lbwrap = wrap                              # smooth pixel resize (its in-card grip)
         cols = ('fav', 'rank', 'fit', 'test', 'dd', 'cagr', 'srt',
-                'tup', 'tdown', 'tflat', 'ls', 'act', 'win', 'wup', 'wdown', 'id', 'formula')
+                'tup', 'tdown', 'tflat', 'ls', 'bal', 'act', 'win', 'wup', 'wdown', 'id', 'formula')
         self.tree = ttk.Treeview(wrap, columns=cols, show='headings',
                                  height=int(self.cfg.get('lb_rows') or 12))
         self._HEAD = {}
@@ -1835,6 +1835,7 @@ class App:
                                ('tup', 'T ↑', 64, 'e'), ('tdown', 'T ↓', 64, 'e'),
                                ('tflat', 'T ~', 64, 'e'),
                                ('ls', 'L/S /yr·a', 100, 'center'),
+                               ('bal', 'L/S %', 84, 'center'),
                                ('act', 'tr/yr·a', 72, 'e'),
                                ('win', 'win%', 62, 'e'),
                                ('wup', 'win ↑', 64, 'e'), ('wdown', 'win ↓', 64, 'e'),
@@ -1880,6 +1881,12 @@ class App:
                      '(|t| below 1.28). Same direction regime as T↑ — see its tooltip.',
             'ls': 'positions opened per asset per year on TEST: long / short\n'
                   '(an annualized rate — comparable across universes and periods)',
+            'bal': 'how the book SITS on TEST: share of exposure long / short,\n'
+                   'time-averaged and inverse-vol weighted (the weights the simulator\n'
+                   'actually trades). 50/50 = market neutral. 100/0 is not an alpha —\n'
+                   'a long-only basket inherits the market\'s Sharpe, and in a bull leg\n'
+                   'it scores well on TRAIN and VAL for reasons that have nothing to do\n'
+                   'with the formula. The search docks fitness past 75/25 (max_net).',
             'act': 'trades per asset per year — relative activity',
             'win': 'share of profitable days on TEST',
             'wup': 'accuracy of the formula\'s UP calls: every (bar, asset) where it\n'
@@ -3824,7 +3831,7 @@ class App:
         lambda c: (c.get('test') if isinstance(c.get('test'), dict) else {}).get('sharpe'))
 
     _SORTABLE = ('fit', 'test', 'dd', 'cagr', 'srt',
-                 'tup', 'tdown', 'tflat', 'ls', 'act', 'win', 'wup', 'wdown', 'formula')
+                 'tup', 'tdown', 'tflat', 'ls', 'bal', 'act', 'win', 'wup', 'wdown', 'formula')
 
     @staticmethod
     def _finite(v):
@@ -3888,8 +3895,8 @@ class App:
     PF_TOP_MIN, PF_TOP_MAX = 2, 20                       # what the 'top' spinner advertises
 
     _LB_OPT_ORDER = ('id', 'dd', 'cagr', 'srt',
-                     'tup', 'tdown', 'tflat', 'ls', 'act', 'win', 'wup', 'wdown')
-    _LB_OPT_DEFAULT = ('dd', 'cagr', 'id', 'win', 'wup', 'wdown', 'tup', 'tdown', 'tflat')
+                     'tup', 'tdown', 'tflat', 'ls', 'bal', 'act', 'win', 'wup', 'wdown')
+    _LB_OPT_DEFAULT = ('dd', 'cagr', 'id', 'win', 'wup', 'wdown', 'tup', 'tdown', 'tflat', 'bal')
 
     def _adv_cols(self):
         """Advanced display columns: the honest core (#/fitness/TEST/formula) plus the user's
@@ -4099,7 +4106,7 @@ class App:
                 m = self._metrics_cache.get(formula)
             need = max(need, self._tree_font.measure(f))   # row; the two spaces are the gutter to
             #                                                the neighbour cell's right-flush value
-            ls, act, win, wup, wdn, srt, tup, tdn, tfl = self._fmt_metrics(m)
+            ls, bal, act, win, wup, wdn, srt, tup, tdn, tfl = self._fmt_metrics(m)
             dd = self._lb_test_ratio(c, m, 'dd', pct=True)
             cagr = self._lb_test_ratio(c, m, 'cagr', pct=True)
             fitcell = ('—' if base is None                        # win-rate-mined rows carry a
@@ -4110,7 +4117,7 @@ class App:
                 ('★' if aid in self._fav_ids else ''),
                 i + 1, fitcell,
                 f'{ts:+.2f}' if ts is not None else '—', dd, cagr, srt,
-                tup, tdn, tfl, ls, act, win, wup, wdn, aid, f),
+                tup, tdn, tfl, ls, bal, act, win, wup, wdn, aid, f),
                 tags=tags)
             self._row_items[formula or ('id:' + aid)] = item
         self._lb_need_px = need + int(28 * self.SCALE)   # + cell padding / a breath of air
@@ -4176,7 +4183,7 @@ class App:
     def _pump_metrics(self):
         """After a redraw: compute the visible rows' stats. Sorting BY a stat column is the one case
         that needs every value at once (else the order is wrong), so there we compute the full set."""
-        if self._sort_col in ('ls', 'act', 'win', 'wup', 'wdown', 'srt',
+        if self._sort_col in ('ls', 'bal', 'act', 'win', 'wup', 'wdown', 'srt',
                               'tup', 'tdown', 'tflat', 'dd', 'cagr'):
             self._start_metrics(self._shown)
         else:
@@ -4206,19 +4213,24 @@ class App:
 
     @staticmethod
     def _fmt_metrics(m):
-        """('L/S', 'tr/yr·a', 'win%', 'win↑', 'win↓', 'sortino', 'T↑', 'T↓', 'T~') strings
-        from the cache: None=still computing, 'err'=failed."""
+        """('L/S', 'L/S %', 'tr/yr·a', 'win%', 'win↑', 'win↓', 'sortino', 'T↑', 'T↓', 'T~')
+        strings from the cache: None=still computing, 'err'=failed."""
         if m is None:
-            return ('·',) * 9                            # still computing (quiet placeholder)
+            return ('·',) * 10                           # still computing (quiet placeholder)
         if m == 'err':
-            return ('—',) * 9
+            return ('—',) * 10
         a = m.get('act', 0.0)
         astr = f'{a:.1f}' if a < 10 else f'{a:.0f}'
         if m.get('long_yr') is not None and m.get('short_yr') is not None:
             ls = f'{m["long_yr"]:.1f}/{m["short_yr"]:.1f}'   # entries / asset / year, by side
         else:                                            # a cache doc from an older worker
             ls = f'{m["long"]:.0f}/{m["short"]:.0f}'
-        return (ls, astr, f'{m["win"] * 100:.0f}%',
+        net = m.get('net')
+        if isinstance(net, (int, float)):                # net/gross in [-1,+1] -> long/short %
+            bal = f'{(1 + net) * 50:.0f}/{(1 - net) * 50:.0f}'
+        else:
+            bal = '—'                                    # a cache doc from an older worker
+        return (ls, bal, astr, f'{m["win"] * 100:.0f}%',
                 App._fmt_winpct(m.get('wup')), App._fmt_winpct(m.get('wdown')),
                 App._fmt_ratio(m.get('sortino')), App._fmt_ratio(m.get('tup')),
                 App._fmt_ratio(m.get('tdown')), App._fmt_ratio(m.get('tflat')))
@@ -4316,8 +4328,9 @@ class App:
             if formula.startswith('id:'):                # locked row: no plaintext to simulate —
                 continue                                 # leave its '—' cells, don't repaint to '·'
             m = self._metrics_cache.get(formula)
-            ls, act, win, wup, wdn, srt, tup, tdn, tfl = self._fmt_metrics(m)
+            ls, bal, act, win, wup, wdn, srt, tup, tdn, tfl = self._fmt_metrics(m)
             self.tree.set(item, 'ls', ls)
+            self.tree.set(item, 'bal', bal)
             self.tree.set(item, 'act', act)
             self.tree.set(item, 'win', win)
             self.tree.set(item, 'wup', wup)
@@ -4332,7 +4345,7 @@ class App:
                         self.tree.set(item, col, self._fmt_ratio(m.get(col), pct=True))
         if seq != self._metrics_seq:
             return
-        if self._sort_col in ('ls', 'act', 'win', 'wup', 'wdown', 'srt',
+        if self._sort_col in ('ls', 'bal', 'act', 'win', 'wup', 'wdown', 'srt',
                               'tup', 'tdown', 'tflat', 'dd', 'cagr'):
             self._treesig = None
             self._render_lb(self._lb_rows() or self._shown)
@@ -4693,6 +4706,7 @@ class App:
                         round(m['long_yr'], 2) if isinstance(m.get('long_yr'), (int, float)) else '',
                         round(m['short_yr'], 2) if isinstance(m.get('short_yr'), (int, float)) else '',
                         round(m['act'], 2) if 'act' in m else '',
+                        round(m['net'], 3) if isinstance(m.get('net'), (int, float)) else '',
                         round(m['win'] * 100, 1) if 'win' in m else '',
                         round(m['wup'] * 100, 1) if isinstance(m.get('wup'), (int, float)) else '',
                         round(m['wdown'] * 100, 1) if isinstance(m.get('wdown'), (int, float)) else '',
@@ -4701,7 +4715,8 @@ class App:
                               'test_dd', 'test_cagr', 'test_sortino',
                               'test_sh_trend_up', 'test_sh_trend_down',
                               'test_sh_flat', 'long', 'short', 'long_yr_a', 'short_yr_a',
-                              'tr_yr_a', 'win_pct', 'call_acc_up_pct', 'call_acc_down_pct',
+                              'tr_yr_a', 'net_over_gross', 'win_pct', 'call_acc_up_pct',
+                              'call_acc_down_pct',
                               'id', 'formula'), out, 'rows')
 
     def _export_library(self):

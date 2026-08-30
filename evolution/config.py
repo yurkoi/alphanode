@@ -111,6 +111,9 @@ def load_config(path=None):
         'fit_se_penalty': cp.getfloat('fitness', 'se_penalty', fallback=1.0),
         'fit_conc_penalty': cp.getfloat('fitness', 'conc_penalty', fallback=0.3),
         'fit_min_eff_n': cp.getfloat('fitness', 'min_eff_n', fallback=3.0),
+        # directional-tilt guard: one-sided books are the market in disguise
+        'fit_net_penalty': cp.getfloat('fitness', 'net_penalty', fallback=0.5),
+        'fit_max_net': cp.getfloat('fitness', 'max_net', fallback=0.5),
         # what base_fit measures: 'sharpe' (default) or 'winrate' — per-bar share of
         # winning active bars, min(TRAIN, VAL), same number the leaderboard's win% shows
         'fit_metric': (cp.get('fitness', 'metric', fallback='sharpe') or 'sharpe').strip().lower(),

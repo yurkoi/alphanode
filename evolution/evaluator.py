@@ -278,6 +278,23 @@ def _mean_eff_n(A, elig, rows):
     return float((1.0 / np.maximum((F * F).sum(axis=1), 1e-12)).mean())
 
 
+def _mean_net(A, V, elig, rows):
+    """Time-average of net/gross — the book's persistent DIRECTIONAL tilt, in [-1, +1]:
+    +1 = every bar fully long, 0 = long and short balance, -1 = fully short.
+
+    Unlike _mean_eff_n this divides by V, because the simulator does: a long in a quiet coin
+    carries more dollars than a long in a wild one, so inverse-vol weighting moves the tilt.
+    A cross-sectional alpha should land near zero; a book that sits at +0.9 is not an alpha,
+    it is the market with extra steps, and in crypto it will inherit the market's Sharpe."""
+    X = np.where(elig[rows], A[rows], 0.0) / np.where(V[rows] > 0, V[rows], np.nan)
+    X = np.where(np.isfinite(X), X, 0.0)
+    g = np.abs(X).sum(axis=1)
+    live = g > 0
+    if not live.any():
+        return 0.0
+    return float((X[live].sum(axis=1) / g[live]).mean())
+
+
 def make_market(panel, tk, raw=None, vol_window=30):
     return precompute_market(panel, tk, raw, vol_window=vol_window)
 
@@ -412,13 +429,24 @@ def evaluate(node, tk, panel, market, splits, vol, exec_rate, ann=ANN, ewma_lamb
         if bf is None:
             return None
         base_fit, blocks_adj = bf
+    sel_rows = None
     if fit and float(fit.get('conc_penalty', 0.0)) > 0:   # independent of the blocks switch
-        rows = ((alpha_panel.index >= splits['train'][0])
-                & (alpha_panel.index < splits['test'][0]))
-        eff_n = round(_mean_eff_n(A, market['base_elig'], rows), 2)
+        sel_rows = ((alpha_panel.index >= splits['train'][0])
+                    & (alpha_panel.index < splits['test'][0]))
+        eff_n = round(_mean_eff_n(A, market['base_elig'], sel_rows), 2)
         need = float(fit.get('min_eff_n', 3.0))
         if eff_n < need:                               # one-coin books bleed fitness
             base_fit -= scale * float(fit['conc_penalty']) * (need - eff_n) / need
+    net = None
+    if fit and float(fit.get('net_penalty', 0.0)) > 0:
+        if sel_rows is None:
+            sel_rows = ((alpha_panel.index >= splits['train'][0])
+                        & (alpha_panel.index < splits['test'][0]))
+        net = round(_mean_net(A, market['V'], market['base_elig'], sel_rows), 3)
+        cap = float(fit.get('max_net', 0.5))            # tilt allowed before it costs anything
+        if abs(net) > cap:                              # one-sided books bleed fitness
+            base_fit -= (scale * float(fit['net_penalty'])
+                         * (abs(net) - cap) / max(1.0 - cap, 1e-9))
 
     rv = pd.concat([tr, va])                    # vector for correlation/novelty
     return {
@@ -426,6 +454,6 @@ def evaluate(node, tk, panel, market, splits, vol, exec_rate, ann=ANN, ewma_lamb
         'size': node.size(),
         'train': m_tr, 'val': m_va, 'test': m_te,
         'train_sharpe': m_tr['sharpe'], 'val_sharpe': m_va['sharpe'],
-        'base_fit': float(base_fit), 'blocks': blocks_adj, 'eff_n': eff_n,
+        'base_fit': float(base_fit), 'blocks': blocks_adj, 'eff_n': eff_n, 'net': net,
         'rv': rv.to_numpy(dtype=np.float32),
     }

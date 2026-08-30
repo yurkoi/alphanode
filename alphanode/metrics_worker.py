@@ -123,7 +123,8 @@ def trade_stats(formula, ctx):
     activity, universe/period independent), long_yr/short_yr the same rate split by side;
     dd/cagr/sortino from the same simulated TEST equity; tup/tdown/tflat = Sharpe by
     market DIRECTION regime (trend_split); wup/wdown = accuracy of the formula's own
-    long / short calls (call_accuracy). 'err' if it doesn't parse or never trades."""
+    long / short calls (call_accuracy); net = the book's directional tilt on TEST, the
+    time-average of net/gross in [-1, +1]. 'err' if it doesn't parse or never trades."""
     from genome import parse
     from evaluator import eval_alpha_panel
     from fastsim import fast_sim
@@ -136,6 +137,12 @@ def trade_stats(formula, ctx):
         chips = np.nansum(np.abs(fc), axis=1, keepdims=True)
         W = fc / np.where(chips == 0.0, 1.0, chips)                      # + long / − short
         side = np.where(W > 0.0005, 1, np.where(W < -0.0005, -1, 0))     # daily side [T,N]
+        # directional tilt on TEST: time-average of net/gross, -1 (all short) .. +1 (all long).
+        # W already carries the inverse-vol weighting and sums to 1 in absolute value per bar,
+        # so the per-bar net IS the row sum; bars where nothing is held are skipped.
+        _g = np.abs(W[tmask]).sum(axis=1)
+        _live = _g > 0
+        net = float((W[tmask][_live].sum(axis=1) / _g[_live]).mean()) if _live.any() else 0.0
         if not np.abs(side[tmask]).any():                               # no positions on TEST — invalid
             return 'err'
         # a "trade" = opening a position: cross into long/short from flat/opposite
@@ -168,7 +175,7 @@ def trade_stats(formula, ctx):
 
         def _fin(v):                                                        # JSON-safe: NaN/inf -> null
             return float(v) if (v is not None and np.isfinite(v)) else None
-        return {'long': long_tr, 'short': short_tr, 'win': win, 'act': act,
+        return {'long': long_tr, 'short': short_tr, 'win': win, 'act': act, 'net': _fin(net),
                 'long_yr': _fin(long_tr / ctx['n_assets'] / ctx['years']),  # entries / asset / year,
                 'short_yr': _fin(short_tr / ctx['n_assets'] / ctx['years']),  # split by side
                 'wup': _fin(wup), 'wdown': _fin(wdown),

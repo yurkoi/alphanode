@@ -27,6 +27,8 @@ def fit_cfg(cfg):
             'se_penalty': cfg.get('fit_se_penalty', 1.0),
             'conc_penalty': cfg.get('fit_conc_penalty', 0.0),
             'min_eff_n': cfg.get('fit_min_eff_n', 3.0),
+            'net_penalty': cfg.get('fit_net_penalty', 0.0),
+            'max_net': cfg.get('fit_max_net', 0.5),
             'metric': cfg.get('fit_metric', 'sharpe')}
 
 
