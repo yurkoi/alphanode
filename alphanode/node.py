@@ -34,6 +34,7 @@ import pandas as pd                                     # noqa: E402
 
 from config import load_config                         # noqa: E402
 from evolution import evolve                           # noqa: E402
+from round_eta import RoundEta                        # noqa: E402
 
 
 def env(k, d):
@@ -333,6 +334,9 @@ def load_existing():
     # resume the round counter from HISTORY (every round is logged there), not from the trimmed
     # top-KEEP leaderboard: evolve() is seed-deterministic, so rewinding the counter to a stale
     # leaderboard round would replay every round since with identical seeds for zero new alphas.
+    for e in history:                                  # ETA priors: the last learned slope per mode
+        if isinstance(e.get('eta_delta'), (int, float)):
+            _eta_priors['refine' if str(e.get('mode', '')).startswith('refin') else 'explore'] = e['eta_delta']
     status['rounds'] = max(max((e.get('round', 0) for e in history), default=0),
                            max((c.get('round', 0) for c in leaderboard), default=0))
     try:                                               # keep the lifetime trials counter across restarts
@@ -615,6 +619,8 @@ def forward_loop():
 
 # ---- main loop ----
 _last_save = [0.0]
+_eta = [None]            # RoundEta of the round in flight (None between rounds)
+_eta_priors = {}         # mode -> dedup-decay slope learned from finished rounds
 
 
 def _vault_scrub(m):
@@ -643,6 +649,13 @@ def _cb(msg):
     else:                                              # per-generation progress -> the live ticker
         status['gen'] = m
     now = time.time()
+    if _eta[0] is not None:                            # remaining time of THIS round (round_eta.py)
+        _eta[0].feed(now, ms)
+        eta = _eta[0].eta(now)
+        status['eta_s'] = None if eta is None else round(eta)
+        status['eta_at'] = now                         # readers subtract their own clock drift
+        status['progress'] = round(_eta[0].progress(now), 4)
+        status['gen_i'] = _eta[0].g + 1                # finished generations, 0..gens
     if now - _last_save[0] > 1.0:                      # live progress for GUI/page (throttle 1s)
         _last_save[0] = now
         save_status()
@@ -759,20 +772,30 @@ def main():
         else:
             log_event('round', f'▶ round {rnd}: explore — a fresh random population, '
                                f'hunting new formula families')
-        save_status()
         t0 = time.time()
+        _eta[0] = RoundEta(mode, POP, GENS, t0, _eta_priors)
+        status.update(round_t0=t0, round_n=rnd, eta_s=None, eta_at=t0, progress=0.0, gen_i=0)
+        save_status()                                  # the new round's bar starts with its banner
         cfg = build_cfg(seed, seeds)
         try:
             hof, _hist, cache = evolve(cfg, log=_cb)
         except KeyboardInterrupt:
             break
         except Exception as e:                         # noqa: BLE001
+            _eta[0] = None
+            status.update(eta_s=None, progress=0.0)
             status['current'] = f'round {rnd}: error {type(e).__name__}: {e}'
             log_event('err', f'✗ round {rnd} failed: {type(e).__name__}: {e}')
             save_status()
             time.sleep(PAUSE)
             continue
 
+        dur = round(time.time() - t0, 1)
+        ld = _eta[0].learned_delta()
+        if ld is not None:                             # next round of this mode starts from what this one showed
+            _eta_priors[_eta[0].mode] = ld
+        _eta[0] = None
+        status.update(eta_s=0, eta_at=time.time(), progress=1.0, gen_i=GENS)
         new = 0
         with open(LIB, 'a', encoding='utf-8') as f:
             for c in champions_from_hof(hof, metric=cfg.get('fit_metric', 'sharpe')):
@@ -793,7 +816,8 @@ def main():
         bb_s = _fmt_fit(champ or {}, bb) if bb_val is not None else '—'
         bt_s = f'{bt_val:+.2f}' if bt_val is not None else '—'
         entry = {'round': rnd, 'best_base': bb_val, 'best_test': bt_val,
-                 'found': len(seen), 'mode': mode, 'ts': iso()}
+                 'found': len(seen), 'mode': mode, 'ts': iso(), 'dur': dur,
+                 'eta_delta': None if ld is None else round(ld, 3)}
         history.append(entry)
         try:
             with open(HIST, 'a', encoding='utf-8') as f:

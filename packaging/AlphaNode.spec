@@ -18,7 +18,7 @@ APP = os.path.join(PROJ, 'alphanode')
 hiddenimports = (
     ['fetch_data', 'apppaths', 'node', 'alphanode_gui', 'portfolio_build', 'cli',
      'signal_service', 'metrics_worker', 'pdf_report', 'pdf_worker', 'rescore_library',
-     'forward_track', 'version', 'buildinfo',
+     'forward_track', 'version', 'buildinfo', 'round_eta',
      'config', 'evolution', 'evaluator', 'fastsim', 'genome', 'primitives',
      'report', 'evolved_strategy', 'experiments',
      # imports of the COMPILED core, which modulegraph can no longer scan (.so has no source):

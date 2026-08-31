@@ -1678,6 +1678,25 @@ class App:
         self.lbl_cur = self._lbl(pad, text='', text_color=MUT, font=(self.MONO, 12),
                                     anchor='w', justify='left')
         self.lbl_cur.pack(anchor='w', fill='x', pady=(12, 0))
+        # ROUND PROGRESS — one bar per round: fills from the node's ETA model (round_eta.py),
+        # resets when the next round starts. Hidden while nothing is running.
+        self.round_card = self._box(pad)
+        rrow = self._box(self.round_card)
+        rrow.pack(fill='x')
+        self.lbl_round_l = self._lbl(rrow, text='', text_color=TXT, font=(self.UI, 12, 'bold'))
+        self.lbl_round_l.pack(side='left')
+        self.lbl_round_r = self._lbl(rrow, text='', text_color=MUT, font=(self.MONO, 12), anchor='e')
+        self.lbl_round_r.pack(side='right')
+        self.round_bar = ctk.CTkProgressBar(self.round_card, height=int(7 * self.SCALE),
+                                            corner_radius=999, progress_color=ACC,
+                                            fg_color=HEAD_BG, border_width=0)
+        self.round_bar.set(0.0)
+        self.round_bar.pack(fill='x', pady=(5, 0))
+        self._round_shown = False
+        self._tip(self.round_bar, 'Progress of the current round. The remaining time comes from the\n'
+                                  'measured cost of one formula evaluation × the formulas still to\n'
+                                  'score (dedup and formula growth are modelled) — not from pop × gens.\n'
+                                  'Accurate to a few % from mid-round; ±15% in the first generations.')
         # LIVE LOG — the node's human-readable activity feed (status.json 'events')
         logwrap = ctk.CTkFrame(pad, fg_color=STRIPE, corner_radius=10, border_width=0)
         logwrap.pack(fill='x', pady=(10, 0))
@@ -3495,6 +3514,63 @@ class App:
             self._events_last = evs
             self._render_events(evs)
 
+    @staticmethod
+    def _round_eta_left(st):
+        """Seconds left in the round in flight, or None. The node stamps eta_s at eta_at
+        (round_eta.py); the GUI polls status.json every 1.5 s, so the seconds between that stamp
+        and now are subtracted here — the countdown runs smoothly instead of jumping once per
+        generation."""
+        eta, at = st.get('eta_s'), st.get('eta_at')
+        if not isinstance(eta, (int, float)) or not isinstance(at, (int, float)):
+            return None
+        return max(0.0, eta - (time.time() - at))
+
+    @staticmethod
+    def _fmt_left(sec):
+        """'~MM:SS' (or 'H:MM:SS'), rounded to 10 s — the estimate is not better than that."""
+        left = (int(sec) + 5) // 10 * 10
+        h, rem = divmod(left, 3600)
+        m, s_ = divmod(rem, 60)
+        return f'~{h}:{m:02d}:{s_:02d}' if h else f'~{m:02d}:{s_:02d}'
+
+    def _show_round_card(self, show):
+        if show and not self._round_shown:
+            self.round_card.pack(fill='x', pady=(10, 0), after=self.lbl_cur)
+        elif not show and self._round_shown:
+            self.round_card.pack_forget()
+        self._round_shown = show
+
+    def _update_round_bar(self, st, live):
+        """One progress bar per round. Fraction = elapsed / (elapsed + eta) — by TIME, so the
+        bar keeps moving inside a generation. Before the model has a rate (gen 0..1) it falls
+        back to finished generations / gens and says so."""
+        t0, rnd = st.get('round_t0'), st.get('round_n')
+        if not live or not isinstance(t0, (int, float)) or not rnd:
+            self._show_round_card(False)
+            return
+        gens = int(st.get('gens') or 0)
+        gen_i = int(st.get('gen_i') or 0)
+        mode = 'refine' if str(st.get('mode', '')).startswith('refin') else 'explore'
+        done = float(st.get('progress') or 0.0) >= 1.0
+        elapsed = max(0.0, time.time() - t0)
+        left = self._round_eta_left(st)
+        if done:
+            frac, right = 1.0, f'done · {int(elapsed) // 60:02d}:{int(elapsed) % 60:02d}'
+            color = POS
+        elif left is None:
+            frac = (gen_i / gens) if gens else 0.0
+            right, color = 'estimating…', ACC
+        else:
+            frac = elapsed / max(1e-9, elapsed + left)
+            right = f'{self._fmt_left(left)} left · {int(frac * 100):d}%'
+            color = ACC
+        gen_s = f' · gen {min(gen_i, gens)}/{gens}' if gens else ''
+        self.lbl_round_l.configure(text=f'round {rnd} · {mode}{gen_s}')
+        self.lbl_round_r.configure(text=right)
+        self.round_bar.configure(progress_color=color)
+        self.round_bar.set(max(0.0, min(1.0, frac)))
+        self._show_round_card(True)
+
     def _poll(self):
         running = bool(self.proc and self.proc.poll() is None)
         self._set_running(running)
@@ -3520,6 +3596,9 @@ class App:
             # the BEST FITNESS tile — drop it; elide long lines at a word, never mid-token
             gen = (st.get('gen', '') or '').split('| best fit')[0].rstrip(' |')
             line = (st.get('current', '') + '   ' + gen).strip()
+            left = self._round_eta_left(st) if live else None
+            if left is not None and float(st.get('progress') or 0.0) < 1.0:
+                line += f'   · {self._fmt_left(left)} left'
             if len(line) > 140:
                 line = line[:140].rsplit(' ', 1)[0] + ' …'
             if not live:                                 # stale config/round text must not read as
@@ -3527,6 +3606,7 @@ class App:
                 line = ('last run — ' + line) if line else line
             self.lbl_res.configure(text=res, fg=MUT if live else FAINT)
             self.lbl_cur.configure(text=line, fg=MUT if live else FAINT)
+            self._update_round_bar(st, live)
             evs = st.get('events') or []
             self._maybe_render_events(evs)
             hist = st.get('history') or []               # the retired PROGRESS chart, as one number
