@@ -32,7 +32,7 @@ import numpy as np                                     # noqa: E402
 np.seterr(divide='ignore', invalid='ignore')
 import pandas as pd                                     # noqa: E402
 
-from config import load_config                         # noqa: E402
+from config import MAX_PAIRS, load_config              # noqa: E402
 from evolution import evolve                           # noqa: E402
 from round_eta import RoundEta                        # noqa: E402
 
@@ -436,7 +436,8 @@ def _apply_overrides(cfg):
 def build_cfg(seed, seeds=None):
     cfg = load_config()                                # segments/vol/penalties from evolution/config.ini
     if UNIVERSE.lower() not in ('all', '*', ''):
-        cfg['instruments'] = [x.strip().upper() for x in UNIVERSE.split(',') if x.strip()]
+        cfg['instruments'] = list(dict.fromkeys(
+            x.strip().upper() for x in UNIVERSE.split(',') if x.strip()))[:MAX_PAIRS]
     cfg.update(pop=POP, gens=GENS, seed=seed, n_jobs=N_JOBS)
     _apply_overrides(cfg)                              # target_vol, genome, GA, fitness, date segments
     if seeds:                                          # warm-start: seed with the best from the library
@@ -672,9 +673,10 @@ def ensure_data():
     path = load_config()['data']
     if UNIVERSE.lower() in ('all', '*', ''):
         want = None                                    # starter set — presence check on file only
-    else:                                              # dedup, upper, order kept (the GUI parser)
+    else:                                              # dedup, upper, order kept, capped
         want = list(dict.fromkeys(x.strip().upper()
-                                  for x in UNIVERSE.split(',') if x.strip())) or None
+                                  for x in UNIVERSE.split(',')
+                                  if x.strip()))[:MAX_PAIRS] or None
 
     def _tickers():
         try:

@@ -136,10 +136,22 @@ def _tf_suffix(tf):
     return '' if (tf or '1d') == '1d' else f'_{tf}'
 
 
-def _parse_universe(raw):
+# Hard cap on the basket. Deliberately a second copy of evolution/config.py's MAX_PAIRS rather
+# than an import: config pulls in pandas, and the GUI defers that to keep the splash instant.
+# tests/test_pair_cap.py fails the moment the two numbers disagree.
+MAX_PAIRS = 20
+
+
+def _parse_universe(raw, cap=MAX_PAIRS):
     """'btc , ethusdt,,ETHUSDT' -> unique upper tickers, order kept. The ONE parser every
-    consumer shares — the panel, the env producers and the worker payloads."""
-    return list(dict.fromkeys(x.strip().upper() for x in (raw or '').split(',') if x.strip()))
+    consumer shares — the panel, the env producers and the worker payloads.
+
+    The cap is applied HERE, not in the editor, so no consumer can be handed a basket over
+    the limit: a settings file written by an older build, a pasted list, a session archive
+    and a worker payload all funnel through this call. `cap=None` reads the raw list, which
+    the editor needs to say HOW MANY pairs it had to drop."""
+    out = list(dict.fromkeys(x.strip().upper() for x in (raw or '').split(',') if x.strip()))
+    return out if cap is None else out[:cap]
 
 
 def _tf_clean(tf):
@@ -216,6 +228,9 @@ PALETTE = {
         ACC_SOFT='#eceffe',  # soft fill / row highlight (indigo-50)
         POS='#059669',       # gain (emerald-600)
         NEG='#e11d48',       # loss (rose-600)
+        LONGC='#4f46e5',     # book side: indigo-600 / amber-600. Deliberately NOT the P&L
+        SHORTC='#d97706',    # green/red — a position is a direction, not a profit, and the
+        #                      cool/warm pair stays legible to a red-green colourblind eye
         HEAD_BG='#f3f5f9',   # tonal surfaces: tiles, buttons, fields
         HEAD_HI='#eaedf4',   # their hover
         STRIPE='#f4f6fb',    # row zebra striping (one visible step below white)
@@ -236,6 +251,8 @@ PALETTE = {
         ACC_SOFT='#262d52',
         POS='#34d399',       # emerald-400 / rose-400: the 600s fail contrast on dark
         NEG='#fb7185',
+        LONGC='#818cf8',     # indigo-400 / amber-400: same reason, lifted for a dark card
+        SHORTC='#fbbf24',
         HEAD_BG='#1d2233',
         HEAD_HI='#262c40',
         STRIPE='#1d2233',    # was #1a1f2d — indistinguishable from CARD on real panels
@@ -247,6 +264,7 @@ PALETTE = {
 # Published by _apply_palette(); declared here so the names exist at import time.
 BG = CARD = BORDER = TXT = MUT = FAINT = ACC = ACC_HI = ACC_DN = ACC_SOFT = ''
 POS = NEG = HEAD_BG = HEAD_HI = STRIPE = GRID = TIP_BG = TIP_FG = TIP_BD = ''
+LONGC = SHORTC = ''
 CARD_BW = 0
 
 
@@ -311,6 +329,10 @@ class App:
         self._sig_status_lbl = {}                         # port -> status Label (main thread only)
         self._sig_shown = None                            # ports currently rendered (rebuild only on change)
         self._sig_pending = None                          # services found by _sig_restore, for the tick
+        self._sig_signal = {}                             # port -> last /signal payload (the positions)
+        self._sig_seen = {}                               # port -> updated_at already pulled from /signal
+        self._sig_canvas = {}                             # port -> positions canvas (main thread only)
+        self._sig_drawn = {}                              # port -> updated_at last painted on that canvas
         self._pf_img_ref = None                           # keep a ref to the equity PhotoImage (else GC)
         self._pf_doc = None                               # last portfolio result (for re-render on resize)
         self._pf_resize_after = None                      # debounce id for resize re-render
@@ -1259,8 +1281,9 @@ class App:
         self.e_uni.bind('<ButtonPress-2>', self._uni_paste)    # middle-click PRIMARY
         self._tip(self.e_uni,
                   'The search, signals and metrics run on exactly this basket.\n'
-                  'Write as many pairs as you like — commas, spaces or line breaks\n'
-                  'separate them — then ENTER turns the whole box into chips.\n'
+                  f'Up to {MAX_PAIRS} pairs — commas, spaces or line breaks separate\n'
+                  f'them — then ENTER turns the whole box into chips. A longer list\n'
+                  f'keeps its first {MAX_PAIRS} and tells you what it dropped.\n'
                   'A paste lands the same way, all at once.\n'
                   '✕ removes a pair; clicking a chip pulls it back down for editing;\n'
                   'Backspace in the empty box pulls the last chip down.\n'
@@ -1314,6 +1337,16 @@ class App:
             x.bind('<Leave>', lambda _e, l=x: l.configure(fg=MUT))
             t.bind('<ButtonRelease-1>', lambda e, sym=s: self._uni_hit(e, self._uni_edit, sym))
             used += w + gap
+        # a silently shortened paste reads as the field eating input — say what happened.
+        # Consumed on render: the warning belongs to the edit that caused it, not for ever.
+        over, self._uni_over = getattr(self, '_uni_over', 0), 0
+        if over:
+            self._lbl(box, text=f'{over} pair{"s" if over > 1 else ""} did not fit — '
+                                f'the basket is capped at {MAX_PAIRS}',
+                      text_color=NEG, font=(self.UI, 11)).pack(anchor='w', pady=(2, 0))
+        elif len(syms) >= MAX_PAIRS:
+            self._lbl(box, text=f'{len(syms)}/{MAX_PAIRS} pairs — remove one to add another',
+                      text_color=FAINT, font=(self.UI, 11)).pack(anchor='w', pady=(2, 0))
 
     def _uni_hit(self, e, fn, sym):
         """Chip actions run on ButtonRelease, and only when the pointer is still over the
@@ -1350,7 +1383,9 @@ class App:
         except Exception:                            # noqa: BLE001 — teardown mid-FocusOut
             return None
         if raw.strip(','):
-            self.v_unilist.set(','.join(_parse_universe(self.v_unilist.get() + ',' + raw)))
+            full = _parse_universe(self.v_unilist.get() + ',' + raw, cap=None)
+            self._uni_over = max(0, len(full) - MAX_PAIRS)     # _uni_render reports it
+            self.v_unilist.set(','.join(full[:MAX_PAIRS]))
         try:
             self.e_uni.delete(0, 'end')
         except Exception:                            # noqa: BLE001
@@ -3332,7 +3367,10 @@ class App:
                 entry['fh'].close()
         except Exception:                                 # noqa: BLE001
             pass
-        self._sig_health.pop(entry['port'], None)
+        # drop the book too: the next service on this port serves a DIFFERENT formula, and
+        # its stale positions must not sit under it while the new one computes its first signal
+        for d in (self._sig_health, self._sig_signal, self._sig_seen, self._sig_drawn):
+            d.pop(entry['port'], None)
         if entry in self._sigs:
             self._sigs.remove(entry)
         self._sig_save()
@@ -3380,6 +3418,10 @@ class App:
                 if lbl.winfo_exists():
                     txt = self._sig_health.get(p, 'starting…')
                     lbl.configure(text=txt, fg=self._sig_status_color(txt))
+        for p, cv in list(self._sig_canvas.items()):      # a fresh signal -> repaint its book
+            if cv.winfo_exists() and self._sig_drawn.get(p) != (
+                    self._sig_signal.get(p) or {}).get('updated_at'):
+                self._draw_signal_positions(p)
         self.root.after(3000, self._sig_tick)
 
     def _render_signal_rows(self):
@@ -3390,6 +3432,7 @@ class App:
         for w in holder.winfo_children():
             w.destroy()
         self._sig_status_lbl = {}
+        self._sig_canvas = {}
         self._sig_shown = tuple(s['port'] for s in self._sigs)
         if not self._sigs:
             self.sig_card.grid_remove()                   # nothing served -> the card gets out of the way
@@ -3431,6 +3474,128 @@ class App:
                                font=(self.UI, 11), wraplength=620, justify='left', anchor='w')
             lbl.pack(anchor='w')
             self._sig_status_lbl[s['port']] = lbl
+            cv = tk.Canvas(info, height=1, bg=CARD, highlightthickness=0, bd=0)
+            cv.pack(fill='x', pady=(6, 0))
+            cv.bind('<Configure>', lambda _e, pt=s['port']: self._draw_signal_positions(pt))
+            self._sig_canvas[s['port']] = cv
+            self._draw_signal_positions(s['port'])
+
+    SIG_POS_MAX = 16                                  # pills drawn; the rest is one summary line
+    SIG_TINT = (0.90, 0.66)                           # pill fill: lightest weight -> heaviest
+
+    @staticmethod
+    def _capsule(cv, x0, x1, ymid, h, fill):
+        """A fully rounded bar/pill. Tk's canvas has no rounded rectangle, so it is a rect
+        between two circles — the caps are what separate a designed shape from a hairline."""
+        r = h / 2.0
+        if x1 - x0 <= h:                              # too short for a body: just the cap
+            cv.create_oval(x0, ymid - r, x0 + h, ymid + r, fill=fill, outline='')
+            return
+        cv.create_rectangle(x0 + r, ymid - r, x1 - r, ymid + r, fill=fill, outline='')
+        cv.create_oval(x0, ymid - r, x0 + h, ymid + r, fill=fill, outline='')
+        cv.create_oval(x1 - h, ymid - r, x1, ymid + r, fill=fill, outline='')
+
+    def _draw_signal_positions(self, port):
+        """Paint the served signal under its service row as a row of pills — ticker and weight
+        together inside one rounded shape, the fill tinted deeper the heavier the position.
+
+        No bars: a bar stretched to the card's width told you nothing, because the card is far
+        wider than five numbers need and every bar came out nearly full. A pill is sized by its
+        own text, so five pairs take a fifth of the row and twenty wrap onto three lines.
+
+        Direction is the fill (indigo long, amber short) plus the sign, NOT green/red: a
+        position is a direction, not a profit, and cool/warm survives a red-green colourblind
+        eye. A canvas, not a stack of widgets — the tick repaints it in place, without churn."""
+        cv = self._sig_canvas.get(port)
+        if cv is None or not cv.winfo_exists():
+            return
+        sig = self._sig_signal.get(port) or {}
+        pos = sig.get('positions') or []
+        cv.delete('all')
+        if not pos:                                       # nothing served yet -> take no space
+            if int(cv['height']) != 1:
+                cv.configure(height=1)
+            return
+        S = self.SCALE
+        shown = pos[:self.SIG_POS_MAX]
+        hidden = len(pos) - len(shown)
+        pillh, gap, vgap, headh = 28 * S, 9 * S, 8 * S, 30 * S
+        f_tick = self._font(self.MONO, 10)
+        f_pct = self._font(self.MONO, 10, 'bold')
+        f_side = self._font(self.UI, 11, 'bold')
+        f_meta = self._font(self.UI, 11)
+
+        w = cv.winfo_width()
+        # ---- lay the pills out first: the height depends on how many lines they wrap onto ----
+        peak = max(abs(p['weight']) for p in pos) or 1.0
+        lo, hi = self.SIG_TINT
+        items = []
+        for p in shown:
+            pct = p.get('weight_pct') or f"{p['weight'] * 100:+.1f}%"
+            tw, pw = f_tick.measure(p['ticker']), f_pct.measure(pct)
+            items.append((p, pct, min(tw + pw + 32 * S, max(pillh, w))))
+        lines, cur, used = [], [], 0.0
+        for it in items:
+            if cur and used + it[2] > w:                  # w<=1 -> one pill per line; harmless,
+                lines.append(cur); cur, used = [], 0.0    # the real layout comes on <Configure>
+            cur.append(it)
+            used += it[2] + gap
+        if cur:
+            lines.append(cur)
+        h = int(headh + len(lines) * pillh + (len(lines) - 1) * vgap
+                + (20 * S if hidden else 0) + 2 * S)
+        if int(cv['height']) != h:                        # only on a real change: configuring the
+            cv.configure(height=h)                        # height re-fires <Configure> -> a loop
+        if w <= 1:                                        # not laid out yet; the bind calls back
+            return
+
+        # ---- header: the two sides first, the metadata after ----
+        gross = sum(abs(p['weight']) for p in pos)
+        lw = sum(p['weight'] for p in pos if p['weight'] > 0)
+        sw = -sum(p['weight'] for p in pos if p['weight'] < 0)
+        x = 0.0
+        for label, val, col in (('LONG', lw, LONGC), ('SHORT', sw, SHORTC)):
+            d = 7 * S
+            cv.create_oval(x, 9 * S - d / 2, x + d, 9 * S + d / 2, fill=col, outline='')
+            t = f'{label} {val * 100:.1f}%'
+            cv.create_text(x + d + 5 * S, 9 * S, text=t, anchor='w', font=f_side, fill=col)
+            x += d + 5 * S + f_side.measure(t) + 18 * S
+        bits = [b for b in (str(sig.get('as_of') or ''), str(sig.get('tf') or ''),
+                            (f'lev {sig["leverage"]:g}' if sig.get('leverage') is not None else ''),
+                            f'gross {gross * 100:.1f}%',
+                            f'net {(lw - sw) * 100:+.1f}%') if b]
+        cv.create_text(x, 9 * S, text='  ·  '.join(bits), anchor='w', font=f_meta, fill=MUT)
+
+        # ---- pills ----
+        for li, line in enumerate(lines):
+            x = 0.0
+            ymid = headh + li * (pillh + vgap) + pillh / 2
+            for p, pct, pw in line:
+                col = LONGC if p['weight'] > 0 else SHORTC
+                # deeper fill = heavier position, so the book's shape reads before any number
+                t = lo - (lo - hi) * (abs(p['weight']) / peak)
+                self._capsule(cv, x, x + pw, ymid, pillh, _mix(col, CARD, t))
+                cv.create_text(x + pw - 12 * S, ymid, text=pct, anchor='e', font=f_pct, fill=col)
+                room = pw - f_pct.measure(pct) - 32 * S
+                cv.create_text(x + 12 * S, ymid, text=self._ellipsize(f_tick, p['ticker'], room),
+                               anchor='w', font=f_tick, fill=TXT)
+                x += pw + gap
+        if hidden:
+            cv.create_text(0, headh + len(lines) * (pillh + vgap) + 4 * S,
+                           text=f'+{hidden} more — the full book is in the JSON', anchor='w',
+                           font=self._font(self.UI, 10), fill=FAINT)
+        self._sig_drawn[port] = sig.get('updated_at')
+
+    @staticmethod
+    def _ellipsize(font, text, room):
+        """`text` trimmed with an ellipsis until it fits `room` px. Returns '' if nothing does."""
+        if room <= 0:
+            return ''
+        if font.measure(text) <= room:
+            return text
+        while text and font.measure(text + '…') > room:
+            text = text[:-1]
+        return (text + '…') if text else ''
 
     @staticmethod
     def _sig_status_color(txt):
@@ -3456,6 +3621,15 @@ class App:
                 age = h.get('age_secs')
                 txt = (f'● serving · updated {h.get("updated_at", "")} ({age:.0f}s ago)'
                        if age is not None else '● serving')
+                # /health is the cheap heartbeat; /signal carries the positions and only changes
+                # once per refresh (15 min by default). Pull the heavy one on a new stamp only.
+                stamp = h.get('updated_at')
+                if stamp and self._sig_seen.get(port) != stamp:
+                    with urllib.request.urlopen(f'http://127.0.0.1:{port}/signal', timeout=5) as r:
+                        sig = json.load(r)
+                    if sig.get('ok'):
+                        self._sig_signal[port] = sig
+                        self._sig_seen[port] = stamp
             elif h.get('error'):
                 txt = f'⚠ {h["error"]}'
             else:                                         # first compute: show the live progress

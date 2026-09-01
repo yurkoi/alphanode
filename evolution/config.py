@@ -15,6 +15,13 @@ try:
 except Exception:                                    # pragma: no cover  (present in the shipped tree)
     _resolve_tf = None
 
+# The basket is capped here, at the engine's own read of the setting, and not only in the GUI:
+# ALPHANODE_UNIVERSE and config.ini are both editable by hand, so a cap that lived in the panel
+# alone would be advice, not a limit. alphanode_gui keeps its own copy of the number rather than
+# importing this module — config pulls in pandas, and the GUI must not pay that at startup;
+# tests/test_pair_cap.py fails if the two ever drift apart.
+MAX_PAIRS = 20
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROJ = os.path.dirname(HERE)
 # Paths can be overridden externally (the built application points to the bundle/user folder).
@@ -44,8 +51,10 @@ def load_config(path=None):
                cp.get('universe', 'instruments', fallback='all')).strip()
     if uni_raw.lower() in ('', 'all', '*'):
         instruments = None                                  # None -> all from data.pickle
-    else:
-        instruments = [x.strip().upper() for x in uni_raw.replace('\n', ',').split(',') if x.strip()]
+    else:                                                   # dedup, upper, order kept, then capped
+        instruments = list(dict.fromkeys(
+            x.strip().upper() for x in uni_raw.replace('\n', ',').split(',') if x.strip()
+        ))[:MAX_PAIRS]
 
     tf_name = os.environ.get('ALPHANODE_TF') or cp.get('timeframe', 'tf', fallback='1d')
     if _resolve_tf is not None:
