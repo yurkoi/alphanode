@@ -245,7 +245,10 @@ def _sig(*_a):
     STOP = True
 
 
-for _s in (signal.SIGTERM, signal.SIGINT):
+# SIGBREAK: on Windows the GUI stops the node with CTRL_BREAK_EVENT (SIGINT can't be sent to
+# a child there) — without a handler the default action kills the process mid-write.
+for _s in (signal.SIGTERM, signal.SIGINT) + \
+          ((signal.SIGBREAK,) if hasattr(signal, 'SIGBREAK') else ()):
     signal.signal(_s, _sig)
 
 try:

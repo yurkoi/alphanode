@@ -3036,10 +3036,14 @@ class App:
             ALPHANODE_TRAIN_START=c['train_start'], ALPHANODE_VAL_START=c['val_start'],
             ALPHANODE_TEST_START=c['test_start'], ALPHANODE_TEST_END=c['test_end'],
         )
+        # Windows: the node gets its OWN process group, so Stop can address it with
+        # CTRL_BREAK_EVENT (SIGINT is unsendable to a child there) without hitting the GUI.
+        flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == 'nt' else 0
         self.proc = subprocess.Popen(_child_cmd('node'), env=env,
                                      cwd=(apppaths.USER_DIR if apppaths.FROZEN else PROJ),
                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                     text=True, encoding='utf-8', errors='replace')
+                                     text=True, encoding='utf-8', errors='replace',
+                                     creationflags=flags)
         threading.Thread(target=self._reader, daemon=True).start()
         self._set_running(True)
 
@@ -3049,11 +3053,38 @@ class App:
 
     def stop(self):
         if self.proc and self.proc.poll() is None:
+            proc = self.proc
             try:
-                self.proc.send_signal(signal.SIGINT)     # the node gently finishes the round and exits
+                # Windows can't deliver SIGINT to a child — CTRL_BREAK_EVENT is the graceful
+                # channel there (the node registers SIGBREAK); POSIX keeps plain SIGINT.
+                proc.send_signal(signal.CTRL_BREAK_EVENT if os.name == 'nt'
+                                 else signal.SIGINT)     # the node finishes the generation and exits
             except Exception:
-                self.proc.terminate()
+                proc.terminate()
+                self._mark_status_stopped()              # a killed node never writes its epitaph
+            else:
+                def _reap():                             # grace ≈ one generation; then the hard way
+                    if proc.poll() is None:
+                        try:
+                            proc.terminate()
+                        except Exception:
+                            pass
+                        self._mark_status_stopped()
+                self.root.after(45000, _reap)
         self.btn_stop.configure(state='disabled')
+
+    def _mark_status_stopped(self):
+        """A terminated node leaves status.json saying 'running' forever — the round bar and the
+        state pill then keep animating a ghost. Stamp the file 'stopped' on its behalf."""
+        try:
+            st = json.load(open(STATUS_FILE, encoding='utf-8'))
+            if st.get('state') in ('running', 'starting'):
+                st['state'] = 'stopped'
+                st['updated'] = datetime.now(timezone.utc).isoformat(timespec='seconds')
+                with open(STATUS_FILE, 'w', encoding='utf-8') as f:
+                    json.dump(st, f, indent=2, ensure_ascii=False, default=str)
+        except Exception:                                # noqa: BLE001 — no file / races: harmless
+            pass
 
     def _on_close(self):
         try:
@@ -3068,6 +3099,7 @@ class App:
                     self._sig_save()
             if self.proc and self.proc.poll() is None:
                 self.proc.terminate()
+                self._mark_status_stopped()              # else the next launch reads a ghost 'running'
             if self._metrics_proc and self._metrics_proc.poll() is None:
                 self._metrics_proc.terminate()           # a batch can outlive the window otherwise
         finally:
@@ -3579,11 +3611,23 @@ class App:
             st = json.load(open(STATUS_FILE, encoding='utf-8'))
         except Exception:
             pass
+        live = False
         if st:
             state = st.get('state', '—')
-            color = {'running': POS, 'starting': ACC}.get(state, MUT)
-            self._state_pill(f'● {"running" if state == "running" else state}', color)
             live = running or state in ('running', 'starting')
+            if live and not running:
+                # status.json can SAY 'running' while nobody runs (a node killed before its final
+                # save — task manager, a crash). Trust it only while fresh: the node re-stamps
+                # 'updated' at least once per generation, so minutes of silence = a ghost.
+                try:
+                    upd = datetime.fromisoformat(st.get('updated', ''))
+                    live = (datetime.now(timezone.utc) - upd).total_seconds() < 120
+                except (ValueError, TypeError):
+                    live = False
+            # the pill states what the GUI believes, not what a possibly-ghost file says
+            color = {'running': POS, 'starting': ACC}.get(state, MUT) if live else MUT
+            self._state_pill(f'● {state if live or state not in ("running", "starting") else "stopped"}',
+                             color)
             vol = st.get('target_vol')
             vol_s = f' · target vol {vol:g}' if isinstance(vol, (int, float)) else ''
             res = (f'CPU budget {st.get("cpu_percent", "?")}% '
@@ -3619,7 +3663,7 @@ class App:
         # the leaderboard is a view of the LIBRARY FILE, not of the node: it must fill
         # even when no status.json exists yet (fresh start, restored session)
         self._refresh_leaderboard(st.get('best', []))
-        if not running and (not st or st.get('state') != 'running'):
+        if not running and not live:
             if not (self.proc and self.proc.poll() is None):
                 self._state_pill('● stopped', MUT)
         try:
