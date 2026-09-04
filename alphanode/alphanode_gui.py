@@ -376,6 +376,8 @@ class App:
         self._tip_after = None
         self._fetching = False                           # a fetch_data child is running (one at a time)
         self._activating = False                         # a vault activation is rewriting library
+        root.report_callback_exception = self._tk_error  # a button that 'does nothing' is a
+        #                                                  swallowed traceback: log it (state/)
         self._starting = False                           # files / a Start hub-check is in flight
         self.cfg = dict(DEFAULTS)
         self._load()
@@ -447,6 +449,24 @@ class App:
                 self.cfg.update(train_start='auto', val_start='auto',
                                 test_start='auto', test_end='today')
         except (ImportError, ValueError):                # no engine on the path: keep the file
+            pass
+
+    def _tk_error(self, etype, value, tb):
+        """Tk's callback-exception hook. The default prints to stderr, which a desktop-launched
+        build has nowhere to show — so a click that raised looked like a click that did nothing
+        (a customer's 'Advanced does not switch'). Every such traceback lands in
+        state/gui_errors.log, timestamped, and still goes to stderr for a terminal run."""
+        import traceback
+        text = ''.join(traceback.format_exception(etype, value, tb))
+        try:
+            sys.stderr.write(text)
+        except Exception:                                # noqa: BLE001 — windowed build: no stderr
+            pass
+        try:
+            with open(os.path.join(STATE_DIR, 'gui_errors.log'), 'a', encoding='utf-8') as f:
+                f.write(f'--- {datetime.now(timezone.utc).isoformat(timespec="seconds")} '
+                        f'v{_build_id()}\n{text}\n')
+        except OSError:
             pass
 
     def _adopt_shared_licence(self):

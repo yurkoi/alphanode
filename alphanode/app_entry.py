@@ -232,6 +232,20 @@ def _selfcheck_body(out):
         r.update()
         out('gui build   : ok, both themes, child_cmd(node) =',
             alphanode_gui._child_cmd('node')[:2], '…')
+        # BOTH shells, and the switch between them: a settings file that opens on the simple
+        # screen used to leave the dashboard untested here — a bundle whose dashboard build
+        # raised (lazy import, missing asset) passed selfcheck and shipped with an 'Advanced'
+        # button that did nothing. Callback exceptions are collected, not just printed.
+        _tk_errs = []
+        r.report_callback_exception = lambda *a: _tk_errs.append(a)
+        _first = app._shell_mode
+        for _mode in (('advanced', 'simple') if _first == 'simple' else ('simple', 'advanced')):
+            app._switch_mode(_mode)
+            for _ in range(20):
+                r.update()
+            assert app._shell_mode == _mode, f'shell did not switch to {_mode}'
+        assert not _tk_errs, 'Tk callback errors during the mode switch: ' + repr(_tk_errs[0][1])
+        out('mode switch : ok, simple <-> advanced (opened on', _first + ')')
         out('ctk         :', ctk.__version__, '· theme assets',
             os.path.isdir(os.path.join(os.path.dirname(ctk.__file__), 'assets', 'themes')))
         # a REAL TkAgg canvas + toolbar — the exact path every equity/progress chart takes.
