@@ -104,7 +104,8 @@ def test_a_typo_is_caught_here_instead_of_killing_the_node():
 
 
 def test_an_unparseable_date_suppresses_the_rest():
-    probs = check_segments('1h', 'yesterday', '', 'soon', '2026-07-01')
+    # NB: '' is no longer garbage — an empty box means 'auto' (the sliding window)
+    probs = check_segments('1h', 'yesterday', 'x', 'soon', '2026-07-01')
     assert len(probs) == 3                               # one per bad box, nothing else
     assert all('YYYY-MM-DD' in m for _f, m in probs)
 
@@ -138,7 +139,17 @@ def test_bars_counts_the_grid_not_the_calendar():
 def test_the_note_is_hidden_while_the_dates_are_fine(gui_app):
     app, _rec, _state = gui_app
     assert app._seg_check() == []
-    assert app.lbl_seg.grid_info() == {}                 # grid_remove: takes no space either
+    # auto mode: the boxes show REAL dates and the note names the mode…
+    assert app.lbl_seg.cget('text').startswith('auto window')
+    from timeframe import seg_value
+    assert app.v_train.get() == seg_value('1h', 'train_start', 'auto'), \
+        'the box shows the resolved date, not the word auto'
+    for v, d in ((app.v_train, '2023-03-01'), (app.v_val, '2024-10-01'),
+                 (app.v_test, '2025-06-01'), (app.v_end, '2026-08-01')):
+        v.set(d)                                         # …four pinned literal dates
+    app.root.update_idletasks()
+    assert app._seg_check() == []
+    assert app.lbl_seg.grid_info() == {}                 # need no note: grid_remove
 
 
 @pytest.mark.gui
@@ -151,9 +162,9 @@ def test_typing_a_backwards_date_shows_the_note_and_reddens_the_box(gui_app):
     assert app.lbl_seg.grid_info() != {}                 # back on the grid, under the fields
     assert app.v_val.widget.cget('border_color') == G.NEG
     assert app.v_test.widget.cget('border_color') == G.BORDER    # only the culprit
-    app.v_val.set(app.cfg['val_start'])                  # …and it clears again
-    app.root.update_idletasks()
-    assert app.lbl_seg.grid_info() == {}
+    app.v_val.set(app.cfg['val_start'])                  # …and it clears again: sentinel boxes
+    app.root.update_idletasks()                          # show the resolved sliding window now,
+    assert app.lbl_seg.cget('text').startswith('auto window')     # not an empty gap
     assert app.v_val.widget.cget('border_color') == G.BORDER
 
 
@@ -188,7 +199,9 @@ def test_untouched_daily_dates_follow_the_saved_timeframe(gui_app):
     through the timeframe selector used to boot with 59,880 bars of 1h — past every limit."""
     app, _rec, _state = gui_app
     assert app.cfg['timeframe'] == '1h'                  # what conftest wrote
-    assert app.cfg['train_start'] == resolve('1h').history
+    assert app.cfg['train_start'] == 'auto'              # sentinels since the sliding window:
+    from timeframe import seg_value                      # they resolve against the SAVED tf
+    assert seg_value('1h', 'train_start', 'auto') == resolve('1h').segments['train_start']
     assert app._seg_check() == []
 
 
@@ -205,3 +218,39 @@ def test_a_hand_typed_window_is_never_rewritten(gui_app):
     app.cfg = dict(G.DEFAULTS)
     app._load()
     assert app.cfg['train_start'] == '2023-03-15'
+
+
+# ---------- the 'today' sentinel: the end follows the calendar ----------
+
+def test_today_sentinel_resolves_to_the_current_utc_date():
+    from datetime import datetime, timezone
+    from timeframe import end_date
+    now = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    assert end_date('today') == end_date('') == end_date(' TODAY ') == now
+    assert end_date('2026-08-30') == '2026-08-30', 'a literal date stays pinned'
+
+
+def test_check_segments_accepts_today_as_the_end():
+    """The user request: TEST end must follow the current date — the validator treats the
+    sentinel as a real date, so the shipped 1d defaults (test_end='today') stay valid."""
+    assert check_segments('1d', '2020-06-01', '2023-01-01', '2024-09-01', 'today') == []
+    probs = check_segments('1d', '2020-06-01', '2023-01-01', 'today', '2024-09-01')
+    assert probs, "the sentinel is only for the END box — 'today' elsewhere is not a date"
+
+
+def test_auto_boxes_pull_the_same_shaped_window_back_from_today():
+    """User spec: every bar size (15m/1h/4h/1d) fills its segments as the SAME-shaped
+    window measured back from the current date — TRAIN 50% / VAL 20% / TEST 30% of 80%
+    of its max_bars — instead of pinned dates that go stale."""
+    from datetime import datetime, timezone
+    from timeframe import seg_value
+    today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    for name in known():
+        t = resolve(name)
+        seg = t.segments
+        assert seg_value(name, 'train_start', 'auto') == seg['train_start']
+        assert seg_value(name, 'test_end', 'auto') == today
+        assert check_segments(name, 'auto', 'auto', 'auto', 'today') == [], name
+        used = t.bars(seg['train_start'], today)
+        assert used <= t.max_bars * 0.85, f'{name}: auto window must leave cap headroom'
+        assert seg['train_start'] < seg['val_start'] < seg['test_start'] < today

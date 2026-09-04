@@ -47,6 +47,23 @@ def user_dir():
 USER_DIR = user_dir()
 
 
+def machine_dir():
+    """The ONE folder every AlphaNode install on this machine shares — dev checkout, .deb,
+    AppImage, all of them — for what belongs to the machine rather than to an install: the
+    subscription key (licence_store). Linux: $XDG_CONFIG_HOME/AlphaNode, i.e. ~/.config/AlphaNode;
+    Windows and macOS: the same base USER_DIR uses, where frozen installs already meet."""
+    if sys.platform.startswith('win') or sys.platform == 'darwin':
+        base = _user_base()
+    else:
+        base = os.environ.get('XDG_CONFIG_HOME') or os.path.expanduser('~/.config')
+    d = os.path.join(base, 'AlphaNode')
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        pass                                             # read-only home: load() just finds nothing
+    return d
+
+
 def state_dir():
     d = os.path.join(USER_DIR, 'state') if FROZEN else os.path.join(HERE, 'state')
     os.makedirs(d, exist_ok=True)

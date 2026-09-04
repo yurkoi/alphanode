@@ -41,7 +41,7 @@ def load_config(path=None):
     cp = configparser.ConfigParser(inline_comment_prefixes=('#', ';'))
     cp.read(path, encoding='utf-8')
 
-    seg = cp['segments']
+    seg = dict(cp['segments'])
     jobs_raw = cp.get('search', 'jobs', fallback='auto').strip()
     jobs = max(1, (os.cpu_count() or 4) - 2) if jobs_raw.lower() == 'auto' else int(jobs_raw)
 
@@ -65,6 +65,10 @@ def load_config(path=None):
     else:                                            # daily fallback (identical to the original engine)
         tf_fields = {'tf': '1d', 'ann': 365.0, 'freq': 'D', 'vol_window': 30,
                      'ewma_lambda': 0.06, 'binance_interval': '1d'}
+    if _resolve_tf is not None:                      # 'auto'/'today' box sentinels -> real dates
+        from timeframe import seg_value
+        for _f in ('train_start', 'val_start', 'test_start', 'test_end'):
+            seg[_f] = seg_value(tf_fields['tf'], _f, seg.get(_f))
 
     # Per-timeframe data snapshot. An explicit ALPHANODE_DATA always wins (the GUI/workers pass
     # the right file); otherwise 1d keeps the historical data.pickle and intraday gets its own

@@ -518,7 +518,8 @@ def test_the_gui_tiles_and_log_refill_after_a_load(gui_app):
     assert app.s_fit.cget('text') == '+2.14'             # from the restored history
     assert 'round 7: explore' in app.logbox.get('1.0', 'end')
     assert 'running' not in app.lbl_state.cget('text')   # …but nothing is actually running
-    assert 'last run' in app.lbl_cur.cget('text')        # and the ticker says as much
+    assert 'last run' in app.lbl_res.cget('text')        # and the config line says as much
+    #                       (lbl_cur went with the advanced spark strip, removed 2026-09-02)
 
 
 # ---- every save gets its own id --------------------------------------------------------

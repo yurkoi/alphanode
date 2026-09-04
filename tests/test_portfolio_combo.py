@@ -113,3 +113,27 @@ def test_gui_dropdown_maps_combo_to_the_cli(gui_app, monkeypatch):
     cmd = calls['cmd']
     i = cmd.index('--select')
     assert cmd[i + 1] == 'combo'
+
+
+def test_auto_size_picks_the_best_size_not_a_fixed_quota():
+    """--top 0: the size itself is searched (user request — 'not always top 6'). Two
+    complementary alphas mix into a near-riskless book; padding it with noise members to
+    any quota only dilutes it, so auto must stop at the pair."""
+    rng = np.random.default_rng(7)
+    base = rng.normal(0.0, 0.01, 400)
+    a = 0.004 + base + rng.normal(0.0, 0.001, 400)
+    b = 0.004 - base + rng.normal(0.0, 0.001, 400)
+    noise = rng.normal(0.0, 0.01, (400, 6))
+    R = np.column_stack([a, b, noise])
+    idx, obj, _ = PB.choose_combo(R, 0)
+    assert idx == [0, 1]
+    assert obj > PB._mix_sharpe(R, list(range(8)), 365), 'beats the take-everything mix'
+
+
+def test_auto_size_is_capped_at_ten_and_floored_at_two():
+    """The owner's ceiling: never more than 10 members, however good the mix looks.
+    25 iid positive columns love dilution — without the cap the search would take ~all."""
+    rng = np.random.default_rng(3)
+    R = rng.normal(0.0005, 0.01, (300, 25))
+    idx, _, _ = PB.choose_combo(R, 0)
+    assert 2 <= len(idx) <= PB.AUTO_MAX == 10

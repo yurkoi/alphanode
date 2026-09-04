@@ -225,7 +225,7 @@ def cmd_forward(args):
     track = ft.load_track()
     if not track['entries']:
         print('forward track is empty — enroll a champion or a portfolio (GUI: double-click '
-              'an alpha → "Forward track ➕"); a headless node then steps it automatically')
+              'an alpha → "Forward track +"); a headless node then steps it automatically')
         return
     for e in track['entries']:
         m = ft.metrics(e)

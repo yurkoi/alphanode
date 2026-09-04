@@ -250,7 +250,7 @@ def test_serving_reads_green_and_only_serving(gui_app):
     assert app._sig_status_color('● serving') == G.POS
     assert app._sig_status_color('⚠ data source unreachable') == G.NEG
     assert app._sig_status_color('○ stopped (the process exited) — port is free') == G.FAINT
-    for neutral in ('starting…', '⏳ computing the first signal…', 'reconnecting…'):
+    for neutral in ('starting…', '○ computing the first signal…', 'reconnecting…'):
         assert app._sig_status_color(neutral) == G.MUT
 
 

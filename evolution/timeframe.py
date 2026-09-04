@@ -14,7 +14,7 @@ Derived quantities:
                          stays comparable; kept at the daily value for now)
 """
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 DAY_SECONDS = 86400
 ANN_DAYS = 365                     # 24/7 market -> 365 calendar days, not 252 trading days
@@ -32,7 +32,7 @@ class Timeframe:
     history: str = '2019-09-05'    # default fetch/search start (also TRAIN start)
     val_start: str = '2021-11-01'  # TRAIN | VAL boundary
     test_start: str = '2023-01-01'  # VAL | TEST boundary
-    test_end: str = '2026-07-05'   # end of TEST (held-out)
+    test_end: str = 'today'        # end of TEST (held-out); 'today' = the current UTC date
     max_pairs: int = 150           # sane default universe size for downloads at this bar size
     max_bars: int = 3000           # ceiling on TRAIN start -> TEST end, in bars (see check_segments)
 
@@ -52,15 +52,26 @@ class Timeframe:
     def bars(self, a, b):
         """How many bars of this size fit in [a, b) — the height of the panel that span builds.
         `a`/`b` are ISO strings or datetimes; a backwards span counts as zero, not negative."""
-        a = a if isinstance(a, datetime) else datetime.fromisoformat(str(a).strip())
-        b = b if isinstance(b, datetime) else datetime.fromisoformat(str(b).strip())
+        a = a if isinstance(a, datetime) else datetime.fromisoformat(end_date(a))
+        b = b if isinstance(b, datetime) else datetime.fromisoformat(end_date(b))
+        #                                    end_date: literals pass through, 'today' resolves
         return max(0, int((b - a).total_seconds() // self.seconds))
 
     @property
     def segments(self):
-        """Recommended TRAIN/VAL/TEST dates for this bar size (train_start = history)."""
-        return {'train_start': self.history, 'val_start': self.val_start,
-                'test_start': self.test_start, 'test_end': self.test_end}
+        """The TRAIN/VAL/TEST window measured BACK from today (user spec): every bar size
+        takes the same SHAPE — TRAIN 50% / VAL 20% / TEST 30% of a budget of 80% of its
+        max_bars — so a freshly picked timeframe studies the most recent history it can
+        afford at any calendar date. The pinned val_start/test_start/test_end fields are
+        legacy anchors kept for reference; this property no longer reads them."""
+        total = int(self.max_bars * 0.8 * self.seconds / 86400)
+        today = datetime.now(timezone.utc)
+
+        def back(days):
+            return (today - timedelta(days=days)).strftime('%Y-%m-%d')
+
+        return {'train_start': back(total), 'val_start': back(int(total * 0.5)),
+                'test_start': back(int(total * 0.3)), 'test_end': 'today'}
 
 
 # Registry. vol_window ≈ 30 days of bars (keeps the "monthly vol" meaning of the daily rolling(30)).
@@ -71,7 +82,9 @@ class Timeframe:
 _TF = {
     '1d':  Timeframe('1d',  '1d',  'D',     86400,   30,
                      history='2019-09-05', val_start='2021-11-01', test_start='2023-01-01',
-                     test_end='2026-07-05', max_pairs=150, max_bars=3_000),
+                     test_end='today', max_pairs=150, max_bars=3_000),   # 1d fits max_bars
+    #                                 open-ended; intraday keeps PINNED ends — 'today' would
+    #                                 blow their max_bars window as the calendar advances
     '4h':  Timeframe('4h',  '4h',  '4h',    14400,  180,          # 30d * 6/day
                      history='2020-06-01', val_start='2023-01-01', test_start='2024-09-01',
                      test_end='2026-07-01', max_pairs=100, max_bars=16_000),
@@ -121,6 +134,29 @@ def known():
 MIN_BARS = 30
 
 
+def end_date(s):
+    """A TEST-end value: a literal date, or the sentinel '' / 'today' / 'auto' meaning the
+    CURRENT UTC date — so the freshest downloaded bar always lands inside TEST (user request:
+    the end must follow today, not the stamp from whenever the segments were typed)."""
+    raw = str(s or '').strip()
+    if raw.lower() in ('', 'today', 'auto'):
+        return datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    return raw
+
+
+def seg_value(tf, field, v):
+    """One date box resolved: '' / 'auto' -> this timeframe's computed-from-today default
+    for that field (see Timeframe.segments); 'today' in the END box -> the current UTC
+    date; a literal date passes through untouched."""
+    t = tf if isinstance(tf, Timeframe) else resolve(tf)
+    raw = str(v or '').strip().lower()
+    if raw in ('', 'auto'):
+        v = t.segments[field]
+    if field == 'test_end':
+        return end_date(v)
+    return str(v).strip()
+
+
 def check_segments(tf, train_start, val_start, test_start, test_end):
     """[] if the four dates are a usable TRAIN/VAL/TEST window for this bar size, otherwise a
     list of (field, problem) pairs, worst first. `field` is the label of the box the user should
@@ -130,6 +166,10 @@ def check_segments(tf, train_start, val_start, test_start, test_end):
     Pure and stdlib-only on purpose: the GUI calls it on every keystroke to paint the note under
     the date fields, and Start calls it again as the hard gate."""
     t = tf if isinstance(tf, Timeframe) else resolve(tf)
+    train_start = seg_value(t, 'train_start', train_start)   # sentinels ('auto'/'today') are
+    val_start = seg_value(t, 'val_start', val_start)         # real dates from here on
+    test_start = seg_value(t, 'test_start', test_start)
+    test_end = seg_value(t, 'test_end', test_end)
     fields = (('TRAIN start', train_start), ('VAL start', val_start),
               ('TEST start', test_start), ('TEST end', test_end))
     bad, when = [], {}

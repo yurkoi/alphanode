@@ -154,10 +154,17 @@ def test_a_heavier_position_is_tinted_deeper():
 
 
 def test_each_side_gets_its_own_hue():
+    """Warm vs cool, not distance-to-token: the fills are heavy tints toward CARD, and
+    a deep amber tinted 88% white sits nearer the indigo token by raw distance while
+    still reading unmistakably warm."""
+    def channels(c):
+        return int(c[1:3], 16), int(c[5:7], 16)          # R, B
     _app, cv = _paint([_pos('AAAUSDT', -0.2), _pos('BBBUSDT', 0.2)])
     fills = [r[2] for r in sorted(_pills(cv), key=lambda r: r[1][0])]
-    assert _dist(fills[0], G.SHORTC) < _dist(fills[0], G.LONGC)
-    assert _dist(fills[1], G.LONGC) < _dist(fills[1], G.SHORTC)
+    r0, b0 = channels(fills[0])
+    r1, b1 = channels(fills[1])
+    assert r0 > b0, 'the short pill must lean warm: ' + fills[0]
+    assert b1 > r1, 'the long pill must lean cool: ' + fills[1]
 
 
 def test_both_themes_define_the_side_colours():

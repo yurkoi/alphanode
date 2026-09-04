@@ -32,6 +32,7 @@ import sys
 import json
 import time
 import difflib
+import hashlib
 import argparse
 import warnings
 import multiprocessing as mp
@@ -44,6 +45,7 @@ for _p in (os.path.join(PROJ, 'evolution'), PROJ, HERE):
 
 import numpy as np                                        # noqa: E402
 import pandas as pd                                       # noqa: E402
+import series_cache                                       # noqa: E402  (the vault's return series)
 warnings.filterwarnings('ignore'); np.seterr(all='ignore')
 
 
@@ -71,10 +73,16 @@ def _testsh(c):
     return t.get('sharpe')
 
 
-def _pick_top(n, select='test', lib=None):
-    """Top-N alphas by the chosen key from the library (diverse, no near-clones)."""
-    key = _basesh if select == 'base' else _testsh
-    lib = lib or os.path.join(_state_dir(), 'library.jsonl')
+def _row_id(c):
+    """A row's public id: the vault's stored one for a sealed doc, the formula's md5 tail (the
+    same value) for plaintext — the name its cached return series file carries."""
+    if c.get('id'):
+        return str(c['id'])
+    f = c.get('formula') or ''
+    return hashlib.md5(f.encode()).hexdigest()[:12] if f else ''
+
+
+def _read_lib(lib):
     rows = []
     for line in open(lib, encoding='utf-8'):
         line = line.strip()
@@ -83,17 +91,49 @@ def _pick_top(n, select='test', lib=None):
                 rows.append(json.loads(line))
             except json.JSONDecodeError:
                 pass
-    rows = [c for c in rows if key(c) is not None and c.get('formula')]   # sealed rows (vault)
-    #                                    carry full metrics but no plaintext — nothing to simulate
+    return rows
+
+
+def _pick_top(n, select='test', lib=None, tf='1d', sealed_ok=False):
+    """Top-N alphas by the chosen key from the library (diverse, no near-clones).
+
+    A sealed row (vault: full metrics, no plaintext) is a candidate only with sealed_ok AND a
+    cached return series to stand in for its simulation (series_cache, written by the node);
+    its near-clone check happens on the series later (sealed_pick) — there is no text to
+    compare. Plaintext rows keep the text check here."""
+    key = _basesh if select == 'base' else _testsh
+    lib = lib or os.path.join(_state_dir(), 'library.jsonl')
+
+    def usable(c):
+        if c.get('formula'):
+            return True
+        return sealed_ok and series_cache.has(_state_dir(), tf, _row_id(c))
+    rows = [c for c in _read_lib(lib) if key(c) is not None and usable(c)]
     rows.sort(key=key, reverse=True)
     kept, top = [], []
     for c in rows[:500]:
-        f = c['formula']
-        if all(difflib.SequenceMatcher(None, f, k).ratio() < 0.85 for k in kept):
-            kept.append(f); top.append(c)
+        f = c.get('formula')
+        if f and any(difflib.SequenceMatcher(None, f, k).ratio() >= 0.85 for k in kept):
+            continue
+        if f:
+            kept.append(f)
+        top.append(c)
         if len(top) >= n:
             break
     return top
+
+
+def _too_few(lib):
+    """The 'not enough alphas' error, honest about WHY when the library is sealed."""
+    try:
+        sealed = sum(1 for c in _read_lib(lib) if c.get('locked') and not c.get('formula'))
+    except OSError:
+        sealed = 0
+    if sealed:
+        return RuntimeError(f'the library is sealed ({sealed} locked alphas) and fewer than 2 '
+                            'have a cached return series yet — the node caches one for every '
+                            'champion it finds from now on; activate the node to unlock everything')
+    return RuntimeError('need at least 2 scored alphas in the library')
 
 
 # ---- worker: simulate one formula on the REAL engine, return the columns Portfolio needs ----
@@ -154,12 +194,21 @@ def _mix_sharpe(R, idx, ann):
     return float(r.mean() / s * np.sqrt(ann))
 
 
+AUTO_MAX = 10                                             # auto-size ceiling (owner's cap: max 10 members)
+
+
 def choose_combo(R, k, ann=365):
     """Greedy forward selection + replace-one local search, maximizing the Sharpe of the
     equal-weight member mix. R: T×M selection-span returns. Returns (indices, objective,
-    evaluations) — hundreds of vector ops instead of C(M,k) brute force."""
+    evaluations) — hundreds of vector ops instead of C(M,k) brute force.
+
+    k <= 0 = auto SIZE: the greedy path is grown to min(AUTO_MAX, M) and the size whose
+    mix scores best on the selection span is kept (floor 2 — one alpha is not a portfolio),
+    then swap-polished at that size. The path scores are already computed by the greedy
+    itself, so choosing the size costs nothing extra."""
     m = R.shape[1]
-    k = max(1, min(int(k), m))
+    auto = int(k) <= 0
+    cap = min(AUTO_MAX, m) if auto else max(1, min(int(k), m))
     evals = 0
 
     def obj(idx):
@@ -168,10 +217,17 @@ def choose_combo(R, k, ann=365):
         return _mix_sharpe(R, idx, ann)
 
     chosen = [max(range(m), key=lambda j: obj([j]))]
-    while len(chosen) < k:
+    path, scores = [tuple(chosen)], [obj(chosen)]
+    while len(chosen) < cap:
         rest = [j for j in range(m) if j not in chosen]
         chosen.append(max(rest, key=lambda j: obj(chosen + [j])))
-    cur = obj(chosen)
+        path.append(tuple(chosen))
+        scores.append(obj(chosen))
+    if auto and len(path) > 1:
+        best = max(range(1, len(path)), key=lambda i: scores[i])
+        chosen, cur = list(path[best]), scores[best]
+    else:
+        cur = scores[-1]
     for _ in range(10):                                   # swap pass: escape greedy myopia
         improved = False
         for pos in range(len(chosen)):
@@ -229,6 +285,10 @@ def _apply_segments(cfg):
     ini's [segments] are the DAILY defaults and would mislabel intraday TEST."""
     names = ('TRAIN_START', 'VAL_START', 'TEST_START', 'TEST_END')
     raw = [os.environ.get('ALPHANODE_' + n) or None for n in names]
+    if any(raw):
+        from timeframe import seg_value              # 'auto'/'today' -> real dates for this tf
+        raw = [seg_value(cfg.get('tf', '1d'), n.lower(), r) if r else None
+               for n, r in zip(names, raw)]
     if not any(raw) and cfg.get('tf', '1d') != '1d':
         from timeframe import resolve
         seg = resolve(cfg['tf']).segments
@@ -250,12 +310,17 @@ def build(top_n, sim_start, jobs, out_path, select='test', pool_n=0):
     _apply_segments(cfg)
     tf = cfg.get('tf', '1d')
     lib = os.path.join(_state_dir(), f'library{"" if tf == "1d" else "_" + tf}.jsonl')
+    if select != 'combo' and top_n <= 0:
+        top_n = 6                                         # auto size is a combo-only concept
     if select == 'combo':
-        # the pool is ranked by FITNESS (TEST never enters the search at any stage)
-        pool_n = pool_n or min(max(4 * top_n, 12), 30)
-        pool = _pick_top(pool_n, 'base', lib)
+        # the pool is ranked by FITNESS (TEST never enters the search at any stage);
+        # auto size (top_n <= 0) needs headroom above the AUTO_MAX ceiling
+        pool_n = pool_n or (30 if top_n <= 0 else min(max(4 * top_n, 12), 30))
+        pool = _pick_top(pool_n, 'base', lib, tf, sealed_ok=True)
         if len(pool) < 2:
-            raise RuntimeError('need at least 2 scored alphas in the library')
+            raise _too_few(lib)
+        if any(not c.get('formula') for c in pool):      # a sealed library: the preview path
+            return _build_sealed(cfg, pool, top_n, out_path, select)
         if len(pool) <= top_n:                            # nothing to choose between
             top = pool
             print(f'· pool has only {len(pool)} distinct alphas — taking them all', flush=True)
@@ -265,9 +330,11 @@ def build(top_n, sim_start, jobs, out_path, select='test', pool_n=0):
         if tf == '1d':
             return _combo_daily(cfg, pool, top_n, sim_start, jobs, out_path)
         return _combo_fast(cfg, pool, top_n, out_path)
-    top = _pick_top(top_n, select, lib)
+    top = _pick_top(top_n, select, lib, tf, sealed_ok=True)
     if len(top) < 2:
-        raise RuntimeError('need at least 2 scored alphas in the library')
+        raise _too_few(lib)
+    if any(not c.get('formula') for c in top):
+        return _build_sealed(cfg, top, top_n, out_path, select)
     if tf == '1d':
         return _build_daily(cfg, top, sim_start, jobs, out_path, select)
     return _build_fast(cfg, top, out_path, select)
@@ -426,6 +493,138 @@ def _build_daily(cfg, top, sim_start, jobs, out_path, select, pre=None, extra=No
     return 0
 
 
+def _frame(rets, lo, hi):
+    """Member returns aligned by TIMESTAMP on the union grid of [lo, hi). Series cached on
+    different days end on different bars — a bar a member has not got is a flat 0.0, never a
+    misalignment (selection_matrix's trim-from-the-end assumes one common grid, which live
+    caches lack)."""
+    cols = [r[(r.index >= lo) & (r.index < hi)] for r in rets]
+    df = pd.concat(cols, axis=1, join='outer').sort_index().fillna(0.0)
+    df.columns = range(len(cols))
+    return df
+
+
+def sealed_pick(rets, lo, hi, k, ann=365, select='combo', clone_corr=0.98):
+    """The sealed builder's selection on the span [lo, hi) — TRAIN+VAL, TEST never enters.
+    Near-clones are dropped by return CORRELATION (there is no formula text to compare), then
+    the plaintext path's own greedy + swap combination search runs on what is left; a non-combo
+    selection keeps every survivor (they were the top-N already). Returns (kept, chosen, obj,
+    evals) — indices into rets."""
+    R = _frame(rets, lo, hi)
+    kept = []
+    for j in range(R.shape[1]):
+        col = R.iloc[:, j]
+        sd = col.std()
+        if not np.isfinite(sd) or sd <= 0:
+            continue                                      # flat on the span: no evidence at all
+        if all(abs(col.corr(R.iloc[:, i])) < clone_corr for i in kept):
+            kept.append(j)
+    if len(kept) < 2:
+        return kept, list(kept), None, 0
+    M = R.iloc[:, kept].to_numpy(dtype=np.float64)
+    if select == 'combo':
+        idx, obj, evals = choose_combo(M, k, ann)
+        return kept, [kept[i] for i in idx], obj, evals
+    return kept, list(kept), _mix_sharpe(M, range(len(kept)), ann), 0
+
+
+def equal_mix(rets, start, end):
+    """The equal-weight mix of member return series on the union grid of [start, end) — the
+    very mix the combination search scored: each member's own vol-targeted book, weighted 1/N."""
+    return _frame(rets, start, end).mean(axis=1)
+
+
+def _build_sealed(cfg, pool, top_n, out_path, select):
+    """A library the vault sealed: no plaintext to simulate, so each row's cached NET return
+    series stands in (series_cache — written by the node at mining time; a plaintext row without
+    one is fastsim'd here). The members are then combined as the EQUAL-WEIGHT mix of those
+    series — exactly the objective the combination search scores, so the report agrees with the
+    pick — but it is a PREVIEW: the real engine's second vol-targeting layer runs only once
+    activation reveals the formulas. The doc carries members, metrics and equity, and nothing
+    tradeable: no formulas, no weights, no signal — open and serve stay behind activation."""
+    from genome import parse
+    from evaluator import build_panel, basket_returns, make_market, eval_alpha_panel
+    from fastsim import fast_sim
+
+    t0 = time.time()
+    tf, ann = cfg.get('tf', '1d'), float(cfg.get('ann', 365))
+    ts, te = cfg['splits']['test']
+    print(f'· sealed library: a preview from {len(pool)} cached return series '
+          '(no formula leaves the vault)…', flush=True)
+    tk, raw, panel = build_panel(cfg['data'], cfg['start'], cfg['end'], cfg.get('instruments'),
+                                 freq=cfg.get('freq', 'D'))
+    market = None
+    rets, rows = [], []
+    for c in pool:
+        p = series_cache.path(_state_dir(), tf, _row_id(c))
+        r = None
+        if os.path.isfile(p):
+            try:
+                r = series_cache.load(p)
+            except Exception:                             # noqa: BLE001 — a torn file: skip the row
+                r = None
+        elif c.get('formula'):                            # revealed after the cache started
+            if market is None:
+                market = make_market(panel, tk, raw, vol_window=cfg.get('vol_window', 30))
+            ap = eval_alpha_panel(parse(c['formula']), panel)
+            r = fast_sim(ap[tk].to_numpy(dtype=np.float64), market, cfg['vol'], cfg['exec'],
+                         ann=ann, ewma_lambda=cfg.get('ewma_lambda', 0.06))
+        if r is None or len(r) < 60:
+            continue
+        rets.append(r)
+        rows.append(c)
+    if len(rows) < 2:
+        raise RuntimeError('the library is sealed and fewer than 2 champions have a cached return '
+                           'series yet — the node caches one for every champion it finds from now '
+                           'on; activate the node to unlock everything')
+    lo, tsel = _combo_window(cfg)
+    kept, chosen, obj, evals = sealed_pick(rets, lo, tsel, top_n, ann, select)
+    if len(chosen) < 2:
+        raise RuntimeError('fewer than 2 distinct cached series cover the selection span')
+    if select == 'combo':
+        print(f'· combo: best mix of {len(chosen)} — TRAIN+VAL Sharpe {obj:+.2f} '
+              f'({evals} combinations evaluated, TEST untouched)', flush=True)
+    members = [rows[i] for i in chosen]
+    mrets = [rets[i] for i in chosen]
+    start = pd.Timestamp(cfg['start'], tz='UTC')
+    comb = equal_mix(mrets, start, te)
+
+    m = _metrics(comb, ts, te, ann)
+    segs = _seg_metrics(comb, cfg['splits'], ann)
+    indiv = [(_metrics(r, ts, te, ann) or {}).get('sharpe') for r in mrets]
+    bh = basket_returns(panel)
+    bh_m = _metrics(bh, ts, te, ann)
+    bh_segs = _seg_metrics(bh, cfg['splits'], ann)
+
+    fmt = '%Y-%m-%d' if tf == '1d' else '%Y-%m-%d %H:%M'
+    ce = (1 + comb.fillna(0.0)).cumprod()
+    be = (1 + bh.reindex(ce.index).fillna(0.0)).cumprod()
+    step = max(1, len(ce) // 3000)
+    ids = [_row_id(c) for c in members]
+    doc = {'ok': True, 'n': len(members), 'sel': select, 'tf': tf, 'sealed': True,
+           'engine': 'cached return series, equal-weight preview',
+           'sim_start': str(pd.Timestamp(cfg['start']).date()),
+           'test': f'{ts.date()}..{te.date()}',
+           'span': f'{ce.index[0].date()}..{te.date()}',
+           'metrics': m, 'basket': bh_m, 'indiv_sharpe': indiv,
+           'segments': segs, 'basket_segments': bh_segs, 'bounds': _bounds(cfg['splits']),
+           'formulas': [f'locked · {i[:6]}' for i in ids],   # NO formulas_full, weights, open_pnl
+           'members': [{'id': i, 'base': c.get('base'), 'fit_metric': c.get('fit_metric'),
+                        'test': c.get('test') if isinstance(c.get('test'), dict) else None}
+                       for i, c in zip(ids, members)],
+           'equity': {'dates': [d.strftime(fmt) for d in ce.index[::step]],
+                      'combined': [round(float(x), 5) for x in ce.values[::step]],
+                      'basket': [round(float(x), 5) for x in be.values[::step]]},
+           'built_secs': round(time.time() - t0, 1)}
+    if select == 'combo':
+        doc['combo'] = {'pool': len(rows), 'obj_tv': round(obj, 3), 'evals': evals,
+                        'pool_secs': round(time.time() - t0, 1)}
+    _write_doc(doc, out_path)
+    print(f'✓ sealed portfolio preview ({tf}): Sharpe {_seg_line(segs)} · {doc["built_secs"]}s '
+          f'→ {out_path}', flush=True)
+    return 0
+
+
 def _build_fast(cfg, top, out_path, select, pre=None, extra=None):
     """Intraday: fastsim per member -> Σ(weight×leverage) -> the same kernel once more.
     The sum is exactly what Portfolio.compute_forecasts produces, so the second vol-targeting +
@@ -515,7 +714,9 @@ def _build_fast(cfg, top, out_path, select, pre=None, extra=None):
 def main():
     ap = argparse.ArgumentParser(
         description='Build a combined Portfolio from the top-N library alphas')
-    ap.add_argument('--top', type=int, default=6)
+    ap.add_argument('--top', type=int, default=6,
+                    help='portfolio size; 0 = auto (combo only): the best size up to 10, '
+                         'chosen on the same TRAIN+VAL span as the members')
     ap.add_argument('--select', choices=('test', 'base', 'combo'), default='test',
                     help='ranking for the top-N: held-out TEST Sharpe (optimistic cherry-pick), '
                          'fitness min(train,val) (TEST stays a clean evaluation), or combo — '
@@ -529,7 +730,7 @@ def main():
     ap.add_argument('--jobs', type=int, default=0, help='parallel workers (0 = auto)')
     ap.add_argument('--out', default=os.path.join(_state_dir(), 'portfolio.json'))
     args = ap.parse_args()
-    jobs = args.jobs if args.jobs > 0 else max(1, min(args.top, (os.cpu_count() or 4) - 2))
+    jobs = args.jobs if args.jobs > 0 else max(1, min(args.top or AUTO_MAX, (os.cpu_count() or 4) - 2))
     try:
         rc = build(args.top, args.sim_start, jobs, args.out, args.select, pool_n=args.pool)
     except Exception as e:                                 # noqa: BLE001

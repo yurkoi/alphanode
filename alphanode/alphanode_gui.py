@@ -31,6 +31,7 @@ import math
 import time
 import queue
 import random
+import re
 from datetime import datetime, timezone, timedelta
 import signal
 import pickle
@@ -70,10 +71,25 @@ METRICS_PY = os.path.join(HERE, 'metrics_worker.py')    # leaderboard trade stat
 PDF_PY = os.path.join(HERE, 'pdf_worker.py')            # analytics PDF dashboard (own process)
 SIGNAL_PORT = 8799                                      # BASE port: each service takes the next free one
 DATA_PICKLE = apppaths.user_data_pickle()               # where the data fetcher writes fresh data
+def _seg_res(tf, field, v):
+    """One date box resolved ('auto'/'today' sentinels -> real dates for this timeframe;
+    evolution/timeframe.seg_value)."""
+    from timeframe import seg_value
+    return seg_value(tf, field, v)
+
+
 STATE_DIR = apppaths.state_dir()
+try:                                                     # a native crash (Tk/X11 segfault) then
+    import faulthandler                                  # leaves every thread's Python stack in
+    os.makedirs(STATE_DIR, exist_ok=True)                # state/crash.log instead of a bare
+    faulthandler.enable(open(os.path.join(STATE_DIR, 'crash.log'), 'w'))   # 'core dumped'
+except Exception:                                        # noqa: BLE001 — diagnostics must never
+    pass                                                 # block the launch
 STATUS_FILE = os.path.join(STATE_DIR, 'status.json')
 SIGNALS_JSON = os.path.join(STATE_DIR, 'signals.json')  # registry of served APIs (survives a restart)
 PORTFOLIO_JSON = os.path.join(STATE_DIR, 'portfolio.json')
+SESSION_PARAMS_JSON = os.path.join(STATE_DIR, 'session_params.json')  # the frozen search
+#                                        contract per timeframe (see _session_conflict)
 PORTFOLIO_PNG = os.path.join(STATE_DIR, 'portfolio_equity.png')
 SETTINGS = apppaths.settings_file()
 CORES = os.cpu_count() or 4
@@ -196,10 +212,13 @@ DEFAULTS = {
     'fit_blocks': 0,        # robust multi-block fitness (experimental); 0 = legacy min(TRAIN,VAL)
     'opt_winrate': False,   # objective: False = Sharpe, True = per-bar win rate (min TRAIN/VAL)
     # date segments (TRAIN < VAL < TEST)
-    'train_start': '2019-09-05', 'val_start': '2021-11-01',
-    'test_start': '2023-01-01', 'test_end': '2026-07-05',
+    'train_start': 'auto', 'val_start': 'auto',      # 'auto' = the tf's window back from today
+    'test_start': 'auto', 'test_end': 'today',
     # appearance
     'theme': '',            # 'light' | 'dark' | '' = follow the OS on first run
+    'ui_mode': 'simple',    # first screen: 'simple' (autopilot + animation) | 'advanced' (dashboard).
+    #                         Fresh installs open simple; _load flips a pre-existing settings file
+    #                         to advanced so nobody's dashboard vanishes on update.
     'settings_open': False,  # settings pane hidden by default; toggled by the header button
     'lb_mode': 'all',       # leaderboard: 'all' = every alpha | 'families' = best per family (deduped)
     'card_order': [],       # dashboard card order (drag a card to reorder); [] = default layout
@@ -216,55 +235,61 @@ DEFAULTS = {
 # constants below, which the whole file reads — so a widget just says fg=TXT and stays theme-correct.
 PALETTE = {
     'light': dict(
-        BG='#edeff5',        # app background (cool light gray)
-        CARD='#ffffff',      # cards
-        BORDER='#e7eaf1',    # hairline borders (controls); cards keep a whisper of it
-        TXT='#111a2e',       # text (slate-900, a touch softer)
-        MUT='#66738a',       # muted (slate-500)
-        FAINT='#97a3b8',     # even fainter (slate-400)
-        ACC='#6366f1',       # accent (indigo-500)
-        ACC_HI='#4f46e5',    # hover
-        ACC_DN='#4338ca',    # pressed
-        ACC_SOFT='#eceffe',  # soft fill / row highlight (indigo-50)
-        POS='#059669',       # gain (emerald-600)
-        NEG='#e11d48',       # loss (rose-600)
-        LONGC='#4f46e5',     # book side: indigo-600 / amber-600. Deliberately NOT the P&L
-        SHORTC='#d97706',    # green/red — a position is a direction, not a profit, and the
-        #                      cool/warm pair stays legible to a red-green colourblind eye
-        HEAD_BG='#f3f5f9',   # tonal surfaces: tiles, buttons, fields
-        HEAD_HI='#eaedf4',   # their hover
-        STRIPE='#f4f6fb',    # row zebra striping (one visible step below white)
-        GRID='#eef1f6',      # chart gridlines
-        CARD_BW=1,           # cards on white need a hairline to separate
-        TIP_BG='#111a2e', TIP_FG='#e5e7eb', TIP_BD='#334155',    # tooltips (dark on light)
+        BG='#F5F3EC',        # warm cream ground (the 2026-09 redesign language)
+        CARD='#FFFFFF',
+        BORDER='#D3D1C7',    # hairline borders
+        TXT='#2C2C2A',
+        MUT='#5F5E5A',
+        FAINT='#888780',
+        ACC='#534AB7',       # muted indigo — text accents, lines, chart strokes
+        ACC_HI='#463DA0',
+        ACC_DN='#3C3489',
+        ACC_SOFT='#EEEDFE',
+        ACC_FILL='#534AB7',  # accent BUTTON fill: white text must hold on it in BOTH themes,
+        ACC_FILL_HI='#463DA0',   # so the fill is its own token — dark ACC is far too light
+        POS='#0F6E56',       # gain (deep green)
+        NEG='#A32D2D',       # loss (brick red)
+        LONGC='#534AB7',     # book side: indigo / amber. Deliberately NOT the P&L green/red —
+        SHORTC='#854F0B',    # a position is a direction, not a profit, and the cool/warm
+        #                      pair stays legible to a red-green colourblind eye
+        HEAD_BG='#F1EFE8',   # tonal surfaces: tiles, buttons, fields
+        HEAD_HI='#EAE7DC',
+        STRIPE='#F1EFE8',    # row zebra / chart washes (the mock's --soft)
+        GRID='#E9E6DC',
+        CARD_BW=1,
+        RUN_BG='#26215C', RUN_RING='#3C3489', RUN_ARC='#AFA9EC',   # the run pill + progress ring
+        TIP_BG='#2C2C2A', TIP_FG='#F1EFE8', TIP_BD='#4A4945',
     ),
     'dark': dict(
-        BG='#0a0c11',        # a step deeper than the cards — the panels read as raised surfaces
-        CARD='#151926',
-        BORDER='#242a3a',
-        TXT='#e7eaf2',
-        MUT='#9fa9bc',
-        FAINT='#6e7a90',
-        ACC='#818cf8',       # indigo-400: the 500 is too dim on a dark card
-        ACC_HI='#a5b4fc',
-        ACC_DN='#6366f1',
-        ACC_SOFT='#262d52',
-        POS='#34d399',       # emerald-400 / rose-400: the 600s fail contrast on dark
-        NEG='#fb7185',
-        LONGC='#818cf8',     # indigo-400 / amber-400: same reason, lifted for a dark card
-        SHORTC='#fbbf24',
-        HEAD_BG='#1d2233',
-        HEAD_HI='#262c40',
-        STRIPE='#1d2233',    # was #1a1f2d — indistinguishable from CARD on real panels
-        GRID='#212637',
-        CARD_BW=0,           # borderless cards: depth comes from the surface tones alone
-        TIP_BG='#2b313f', TIP_FG='#e8ebf2', TIP_BD='#3d4557',    # lighter than the card, not darker
+        BG='#121212',
+        CARD='#1C1C1C',
+        BORDER='#2E2E2E',
+        TXT='#F1EFE8',
+        MUT='#B4B2A9',
+        FAINT='#888780',
+        ACC='#AFA9EC',       # lifted indigo for dark text accents / strokes
+        ACC_HI='#CECBF6',
+        ACC_DN='#3C3489',
+        ACC_SOFT='#26215C',
+        ACC_FILL='#3C3489',  # deep fill so the white button label stays readable
+        ACC_FILL_HI='#4A41A6',
+        POS='#5DCAA5',
+        NEG='#F09595',
+        LONGC='#AFA9EC',
+        SHORTC='#FAC775',
+        HEAD_BG='#262626',
+        HEAD_HI='#2E2E2E',
+        STRIPE='#212121',
+        GRID='#282828',
+        CARD_BW=1,           # the redesign keeps hairlines in the dark theme too
+        RUN_BG='#3C3489', RUN_RING='#26215C', RUN_ARC='#CECBF6',
+        TIP_BG='#262626', TIP_FG='#F1EFE8', TIP_BD='#3E3E3E',
     ),
 }
 # Published by _apply_palette(); declared here so the names exist at import time.
 BG = CARD = BORDER = TXT = MUT = FAINT = ACC = ACC_HI = ACC_DN = ACC_SOFT = ''
 POS = NEG = HEAD_BG = HEAD_HI = STRIPE = GRID = TIP_BG = TIP_FG = TIP_BD = ''
-LONGC = SHORTC = ''
+LONGC = SHORTC = ACC_FILL = ACC_FILL_HI = RUN_BG = RUN_RING = RUN_ARC = ''
 CARD_BW = 0
 
 
@@ -354,20 +379,28 @@ class App:
         self._starting = False                           # files / a Start hub-check is in flight
         self.cfg = dict(DEFAULTS)
         self._load()
+        self._adopt_shared_licence()                     # one activation per machine
         self._lb_mode = self.cfg.get('lb_mode') or 'all'   # remembered across restarts
         self.cfg['theme'] = _apply_palette(self.cfg.get('theme') or _system_theme())
         self._init_window()
         self._style()
         self._splash()                                    # logo intro; hides the window until done
-        self._build()
-        self._poll()
-        self._sig_tick()                                  # live status of the served signal APIs
+        self._shell_mode = 'advanced'
+        if (self.cfg.get('ui_mode') or 'advanced') == 'simple':
+            self._build_simple()
+        else:
+            self._enter_advanced()
+        if not getattr(self, '_sig_tick_on', False):      # runs under BOTH shells (every touch it
+            self._sig_tick_on = True                      # makes is widget-guarded): adopted
+            self._sig_tick()                              # services stay owned even before the
+        #                                                  dashboard is ever built
         threading.Thread(target=self._sig_restore, daemon=True).start()   # re-adopt ones left running
         if not getattr(self, '_splash_on', False):       # first run: no data -> fetch 10 majors.
             self._boot_arm()                             # With a splash up its dialog must not pop
         #                                                  mid-intro — finish() arms it instead.
         root.protocol('WM_DELETE_WINDOW', self._on_close)
         self.root.after(400, self._eula_gate)            # one-time licence acceptance (post-splash)
+        self.root.after(1500, self._auto_activate)       # seat + reveal for THIS install, no click
 
     # ---------- settings (persist) ----------
     def _load(self):
@@ -375,8 +408,12 @@ class App:
             saved = json.load(open(SETTINGS, encoding='utf-8'))
         except Exception:
             return                                       # fresh install -> DEFAULTS
-        for dead in ('ui_mode', 'welcomed'):             # retired with Simple mode — drop them so
-            saved.pop(dead, None)                        # a legacy file stops carrying them forward
+        saved.pop('welcomed', None)                      # retired key — drop it from legacy files
+        if saved.get('ui_mode') not in ('simple', 'advanced'):
+            saved['ui_mode'] = 'advanced'                # a saved file predating (or from the OLD,
+        #                                                  since-retired) Simple mode: its user has
+        #                                                  a dashboard — keep it; only fresh
+        #                                                  installs open on the simple screen
         self.cfg.update(saved)
         # 2026-08: the universe simplifies to ONE explicit list. 'All loaded pairs' migrates to
         # the pairs actually in that user's active snapshot — same basket, zero surprise; the
@@ -399,11 +436,116 @@ class App:
         try:
             from timeframe import known as _tf_known, resolve as _rtf
             _t = _rtf(_tf_clean(self.cfg.get('timeframe', '1d')))
-            _seg = {k: str(self.cfg.get(k, '')) for k in _t.segments}
-            if _seg != _t.segments and any(_seg == _rtf(n).segments for n in _tf_known()):
-                self.cfg.update(_t.segments)
+            _seg = {k: str(self.cfg.get(k, '')) for k in ('train_start', 'val_start',
+                                                          'test_start')}
+
+            def _legacy3(n):                             # the pinned pre-'auto' defaults a stale
+                _x = _rtf(n)                             # settings file may still carry
+                return {'train_start': _x.history, 'val_start': _x.val_start,
+                        'test_start': _x.test_start}
+            if any(_seg == _legacy3(n) for n in _tf_known()):
+                self.cfg.update(train_start='auto', val_start='auto',
+                                test_start='auto', test_end='today')
         except (ImportError, ValueError):                # no engine on the path: keep the file
             pass
+
+    def _adopt_shared_licence(self):
+        """One activation per MACHINE, whichever screen or install it happened on: a key the hub
+        accepted anywhere here (dev checkout, .deb, AppImage; simple or advanced) sits in
+        licence_store, and an install whose own settings hold none adopts it at launch. The
+        startup auto-activation then makes this install whole — its seat, its sealed rows."""
+        self._licence_adopted = False
+        try:
+            import licence_store
+            tok = licence_store.load()
+            if self.cfg.get('vault_license'):            # this install already has one: seed the
+                if not tok:                              # store, so the others stop asking
+                    licence_store.save(self.cfg['vault_license'])
+                return
+        except Exception:                                # noqa: BLE001 — never block a launch
+            return
+        if tok:
+            self.cfg['vault_license'] = tok
+            self._licence_adopted = True
+
+    @staticmethod
+    def _sealed_rows_exist(state_dir):
+        """Does any local library still hold a row the vault sealed and nothing has revealed?"""
+        try:
+            names = sorted(os.listdir(state_dir))
+        except OSError:
+            return False
+        for name in names:
+            if not (name.startswith('library') and name.endswith('.jsonl')):
+                continue
+            try:
+                with open(os.path.join(state_dir, name), encoding='utf-8') as f:
+                    for ln in f:
+                        if '"locked"' not in ln:
+                            continue
+                        try:
+                            d = json.loads(ln)
+                        except json.JSONDecodeError:
+                            continue
+                        if d.get('locked') and d.get('formula_enc') and not d.get('formula'):
+                            return True
+            except OSError:
+                continue
+        return False
+
+    def _after_activation(self):
+        """Every screen learns the library is open — whichever one the key was entered on:
+        caches dropped, the dashboard table re-read, the simple cards re-rendered and the
+        portfolio rebuilt with the real engine (a sealed preview is stale the moment rows open)."""
+        self._lib_cache['ts'] = 0
+        self._treesig = None
+        self._sm_champ_sig = None
+        if getattr(self, '_shell_mode', '') == 'simple':
+            self._sm_lic_refresh()
+            if (not (self.proc and self.proc.poll() is None)
+                    and self._count_lines(self._lib_file()) >= 2):
+                self._simple_build_portfolio()
+
+    def _auto_activate(self):
+        """Startup: with a known key, make THIS install whole without a click — claim its seat
+        and reveal whatever its libraries still hold sealed: rows mined while the hub was down,
+        or by an install that only just adopted the machine's key. Skipped when nothing is
+        sealed (no hub round-trip for nothing), while a node runs, or while an activation is
+        already in flight. A refusal is logged; for an adopted key it also hands the Activate
+        button back instead of pretending."""
+        tok = str(self.cfg.get('vault_license') or '')
+        if not tok or self._activating or (self.proc and self.proc.poll() is None):
+            return
+        self._activating = True
+        res = {}
+
+        def work():
+            try:
+                if not self._sealed_rows_exist(STATE_DIR):
+                    res['out'] = (None, None)
+                else:
+                    res['out'] = (self._vault_activate_all(tok), None)
+            except Exception as ex:                      # noqa: BLE001
+                res['out'] = ('', str(ex) or type(ex).__name__)
+
+        def tick():
+            if 'out' not in res:
+                self.root.after(200, tick)
+                return
+            self._activating = False
+            msg, err = res['out']
+            if err:
+                print(f'[vault] auto-activation skipped: {err}', flush=True)
+                if self._licence_adopted:                # the hub said no to the shared key —
+                    self.cfg['vault_license'] = ''       # this install is not activated, say so
+                    self._licence_adopted = False
+                    self._sm_lic_refresh()
+                return
+            if msg is not None:
+                print(f'[vault] auto-activation: {msg}', flush=True)
+                self._after_activation()
+        threading.Thread(target=work, daemon=True).start()
+        self.root.after(200, tick)
 
     @staticmethod
     def _gi(var, d):
@@ -451,8 +593,7 @@ class App:
             corr_penalty=self._gf(self.v_corrp, d['corr_penalty']),
             hof_capacity=self._gi(self.v_hof, d['hof_capacity']),
             fit_blocks=self._gi(self.v_fitblocks, d['fit_blocks']),
-            train_start=self.v_train.get().strip(), val_start=self.v_val.get().strip(),
-            test_start=self.v_test.get().strip(), test_end=self.v_end.get().strip(),
+            **self._collect_segments(),
         )
 
     def _save(self):
@@ -500,6 +641,9 @@ class App:
         """Schedule the first-run bootstrap check exactly once — it is armed either straight from
         __init__ (no splash) or from the splash's finish(), and a skip-click racing __init__ could
         otherwise arm it twice."""
+        if getattr(self, '_shell_mode', 'advanced') == 'simple':
+            return                                       # simple: Start owns the data step —
+        #                                                  no first-run dialog over the intro
         if not getattr(self, '_boot_armed', False):
             self._boot_armed = True
             self.root.after(900, self._maybe_bootstrap)
@@ -518,21 +662,34 @@ class App:
             W, H = int(640 * S), int(340 * S)
             top = tk.Toplevel(self.root)
             top.overrideredirect(True)                   # bare rectangle: no WM title bar
-            top.configure(bg=BORDER)                     # 1px hairline around the canvas
             sw, sh = top.winfo_screenwidth(), top.winfo_screenheight()
             top.geometry(f'{W}x{H}+{(sw - W) // 2}+{max(0, (sh - H) // 2 - int(20 * S))}')
             try:
                 top.attributes('-topmost', True)
             except tk.TclError:
                 pass
-            cv = tk.Canvas(top, width=W - 2, height=H - 2, bg=BG, highlightthickness=0, bd=0)
-            cv.place(x=1, y=1)
+            # An X11 toplevel is forever square, so the ROUNDING is painted: the canvas ground
+            # is a shadow tone and the card itself is a smooth polygon with soft corners —
+            # the four notches read as shadow on any desktop (user: 'углы не такие острые').
+            back = _mix(BG, '#000000', 0.6)
+            top.configure(bg=back)
+            cv = tk.Canvas(top, width=W, height=H, bg=back, highlightthickness=0, bd=0)
+            cv.place(x=0, y=0)
+            r = 26 * S                                   # smoothing eats ~30%: lands near 16px
+            x1, y1 = W - 2, H - 2
+            cv.create_polygon(
+                2 + r, 2, x1 - r, 2, x1, 2, x1, 2 + r, x1, y1 - r, x1, y1, x1 - r, y1,
+                2 + r, y1, 2, y1, 2, y1 - r, 2, 2 + r, 2, 2,
+                smooth=True, fill=BG, outline=BORDER)    # the hairline rides the curve
             self.root.withdraw()
             self._splash_on = True
 
             cx, cy = W / 2, H / 2
             # the lockup: [dot] [gap] AlphaNode — measured to center it as a whole
-            f_word = tkfont.Font(family=self.UI, size=self._px(52), weight='bold')
+            # the app-wide font CACHE, not a transient Font: a transient's __del__ calls
+            # Tcl from whatever thread runs the GC later — the X-protocol race behind the
+            # SIGSEGV in Tk_MeasureChars/_XReply (core dump, 2026-09-01)
+            f_word = self._font(self.UI, 52, 'bold')
             widths = [f_word.measure(ch) for ch in 'AlphaNode']
             dot_d, gap = 25 * S, 15 * S
             x0 = cx - (dot_d + gap + sum(widths)) / 2
@@ -766,7 +923,7 @@ class App:
         # the drop-down list is a plain Tk listbox created by ttk — reachable only via the
         # option database; re-adding on a theme switch overrides the previous values
         for opt, val in (('background', HEAD_BG), ('foreground', TXT),
-                         ('selectBackground', ACC), ('selectForeground', '#ffffff'),
+                         ('selectBackground', ACC_SOFT), ('selectForeground', TXT),
                          ('borderWidth', 0), ('font', self._font(F, 13))):
             self.root.option_add(f'*TCombobox*Listbox.{opt}', val)
 
@@ -882,20 +1039,26 @@ class App:
                                       height=34, width=112)
         self.btn_settings.pack(side='right', padx=(0, 16), pady=(2, 0))
         self._tip(self.btn_settings, 'Show / hide the search settings panel.')
+        b_simple = self._btn(top, '◱  Simple', lambda: self._switch_mode('simple'), kind='soft',
+                             height=34, width=96)
+        b_simple.pack(side='right', padx=(0, 8), pady=(2, 0))
+        self._tip(b_simple, 'Back to the simple screen. The search, the served APIs and the\n'
+                            'forward track all keep running — only the face changes.')
         self.btn_sessions = self._btn(top, '⧉  Sessions', self._sessions_open, kind='soft',
                                       height=34, width=112)
         self.btn_sessions.pack(side='right', padx=(0, 8), pady=(2, 0))
         self._tip(self.btn_sessions, 'Snapshots of the whole workspace — formulas, forward\n'
                                      'track, portfolio, settings. Save one, load an older one;\n'
                                      'an auto snapshot is taken every time the node stops.')
-        self.btn_stop = self._btn(top, '■  Stop', self.stop, kind='soft', height=34, width=88)
-        self.btn_stop.configure(state='disabled')
-        self.btn_stop.pack(side='right', padx=(0, 8), pady=(2, 0))
-        self.btn_start = self._btn(top, '▶  Start node', self.start, kind='accent',
-                                   height=34, width=136)
-        self.btn_start.pack(side='right', padx=(0, 8), pady=(2, 0))
-        self._tip(self.btn_start, 'Start the background search with the current settings.')
-        self._tip(self.btn_stop, 'Gently stop the search (the current round will finish).')
+        pill = tk.Canvas(top, width=int(150 * self.SCALE), height=int(38 * self.SCALE),
+                         bg=BG, highlightthickness=0, bd=0, cursor='hand2')
+        pill.pack(side='right', padx=(0, 8), pady=(2, 0))
+        pill.bind('<Button-1>', lambda _e: self._run_pill_click())
+        self.run_pill = pill
+        self._pill_paint(pill, 'idle', None, 'Start node')
+        self._tip(pill, 'One control for the node: press to start the search, press again to\n'
+                        'stop it gently (the current round finishes). While running, the ring\n'
+                        'is the round progress from the ETA model.')
         # metadata packs LAST: on a narrow window pack squeezes the latest widgets first, and the
         # subtitle/node-id must lose that fight — never the Start button (it clipped to 'tart n')
         self._lbl(top, text='background search for trading strategies', text_color=MUT,
@@ -968,6 +1131,9 @@ class App:
         _apply_palette(theme)
         self._style()
         self._shell.destroy()
+        if self._shell_mode == 'simple':                 # the simple shell re-paints itself whole;
+            self._build_simple()                         # none of the dashboard re-renders below
+            return                                       # exist in this mode
         self._pf_last_w = 0                              # force the equity image to re-render
         self._treesig = None                             # and the table to re-fill
         self._sig_shown = None
@@ -1065,7 +1231,10 @@ class App:
         inner.bind('<Configure>', _sync)                 # note) — the pane follows, fields never clip
         self._bind_wheel(canvas)
 
-        self._head(inner, 'SEARCH SETTINGS').pack(anchor='w', pady=(0, 10))
+        self._head(inner, 'SEARCH SETTINGS').pack(anchor='w', pady=(0, 2))
+        self._lbl(inner, text='★ locked to the session — to change these, stop and Clear node',
+                  text_color=FAINT, font=(self.UI, 11), wraplength=self.UNI_WRAP,
+                  justify='left').pack(anchor='w', pady=(0, 10))
 
         # --- resources ---
         self._lbl(inner, text='Resources (CPU share)', text_color=MUT,
@@ -1084,7 +1253,7 @@ class App:
 
         # --- pairs universe (ONE explicit list — the search, signals and metrics all
         #     run on exactly this basket; market data downloads itself at Start) ---
-        self._lbl(inner, text='Which pairs to trade', text_color=MUT,
+        self._lbl(inner, text='★ Which pairs to trade', text_color=MUT,
                      font=(self.UI, 13)).pack(anchor='w', pady=(0, 2))
         self.v_unilist = tk.StringVar(value=self.cfg['universe_list'])
         self._uni_build(inner)
@@ -1129,7 +1298,7 @@ class App:
                                  tip='Pause between rounds so the machine gets a breather.')
         self.v_port = self._num(g, 'Status port', self.cfg['port'], 4, 1024, 65535, 1,
                                 tip='Port for the status web page (http://localhost:PORT).')
-        self.v_optwr = self._chk(g, 'Optimize by win rate', self.cfg.get('opt_winrate', False), 5,
+        self.v_optwr = self._chk(g, '★ Optimize by win rate', self.cfg.get('opt_winrate', False), 5,
                                  tip='The search maximizes min(TRAIN, VAL) of the per-bar win rate,\n'
                                      'shrunk by evidence (damped by activity share, minus a binomial SE)\n'
                                      'so sparse lucky streaks can\'t outrank dense honest ones.\n'
@@ -1152,9 +1321,9 @@ class App:
 
         # --- simulation ---
         g = self._section(inner, 'SIMULATION')
-        self.v_vol = self._numf(g, 'Target-vol (ann.)', self.cfg['target_vol'], 0, 0.01, 3.0, 0.01,
+        self.v_vol = self._numf(g, '★ Target-vol (ann.)', self.cfg['target_vol'], 0, 0.01, 3.0, 0.01,
                                 tip='Target annual portfolio volatility — sets the scale of positions/leverage.')
-        self.v_exec = self._numf(g, 'Fee (turnover)', self.cfg['exec_cost'], 1, 0.0, 0.05, 0.0005,
+        self.v_exec = self._numf(g, '★ Fee (turnover)', self.cfg['exec_cost'], 1, 0.0, 0.05, 0.0005,
                                  tip='Fee per trade, as a fraction of turnover. 0.001 = 10 basis points.')
 
         # --- genome ---
@@ -1185,7 +1354,7 @@ class App:
                                   tip='Penalty for similarity to an already found alpha — for diversity.')
         self.v_hof = self._num(g, 'Hall of Fame size', self.cfg['hof_capacity'], 3, 1, 100, 1,
                                tip='How many champions to keep as output per round.')
-        self.v_fitblocks = self._num(g, 'Robust blocks (0 = legacy)', self.cfg.get('fit_blocks', 5),
+        self.v_fitblocks = self._num(g, '★ Robust blocks (0 = legacy)', self.cfg.get('fit_blocks', 5),
                                      4, 0, 12, 1,
                                      tip='Robust fitness: the selection span is cut into K regime\n'
                                          'blocks; each block\'s Sharpe is shrunk by its standard\n'
@@ -1195,18 +1364,22 @@ class App:
 
         # --- segments ---
         g = self._section(inner, 'DATE SEGMENTS  (TRAIN < VAL < TEST)')
-        self.v_train = self._txt(g, 'TRAIN start', self.cfg['train_start'], 0,
-                                 tip='Start of the training period (evolution runs on it).\n'
+        self.v_train = self._txt(g, '★ TRAIN start', self._seg_disp('train_start'), 0,
+                                 tip="'auto' = this timeframe's window measured back from today\n"
+                                     '(same shape on every bar size). Or a fixed date.\n'
+                                     'Start of the training period (evolution runs on it).\n'
                                      'Also the start of the whole window, so this is the field\n'
                                      'that decides whether the span fits the bar size\'s limit —\n'
                                      'see the line under the timeframe selector.')
-        self.v_val = self._txt(g, 'VAL start', self.cfg['val_start'], 1,
+        self.v_val = self._txt(g, '★ VAL start', self._seg_disp('val_start'), 1,
                                tip='Start of validation — a robustness check.')
-        self.v_test = self._txt(g, 'TEST start', self.cfg['test_start'], 2,
+        self.v_test = self._txt(g, '★ TEST start', self._seg_disp('test_start'), 2,
                                 tip='Start of the held-out test — an honest OOS, not part of selection.')
-        self.v_end = self._txt(g, 'TEST end', self.cfg['test_end'], 3,
+        self.v_end = self._txt(g, '★ TEST end', self._seg_disp('test_end'), 3,
                                tip='End of the entire data period. Strictly after TEST start —\n'
-                                   'the four dates must read TRAIN < VAL < TEST < end.')
+                                   'the four dates must read TRAIN < VAL < TEST < end.\n'
+                                   "Write the word 'today' and the end follows the current\n"
+                                   'date — the freshest bars always land inside TEST.')
         # The four boxes are free text, and until now nothing read them until the node was
         # already running: a reversed pair silently produced an empty slice (numbers computed
         # on no data), a typo'd date killed the node at load_config with no window to show it
@@ -1234,7 +1407,7 @@ class App:
     # Tonal buttons (soft fills, no outlines) — the filled surface IS the affordance.
     _BTN = {                                             # kind -> (fill, hover, text)
         'plain':  lambda: (HEAD_BG, HEAD_HI, TXT),
-        'accent': lambda: (ACC, ACC_HI, '#ffffff'),
+        'accent': lambda: (ACC_FILL, ACC_FILL_HI, '#ffffff'),
         'soft':   lambda: (HEAD_BG, HEAD_HI, TXT),
         'danger': lambda: (_mix(NEG, CARD, 0.88), _mix(NEG, CARD, 0.80), NEG),
     }
@@ -1309,6 +1482,7 @@ class App:
         pad = int(7 * self.SCALE)
         xpad = int(4 * self.SCALE)
         tail = int(2 * self.SCALE)
+        _locked = getattr(self, '_settings_locked', False)   # a frozen basket: no ✕, no hover
         row, used = None, 0
         for s in syms:
             # exact, not estimated: both labels are bd=0, so a chip is text + ✕ + paddings
@@ -1322,9 +1496,10 @@ class App:
             chip = tk.Frame(row, bg=HEAD_BG, highlightbackground=BORDER, highlightthickness=1)
             chip.pack(side='left', padx=(0, gap))
             t = tk.Label(chip, text=s, fg=TXT, bg=HEAD_BG, font=ft, bd=0, anchor='w',
-                         padx=pad, pady=int(3 * self.SCALE), cursor='hand2')
-            x = tk.Label(chip, text='✕', fg=MUT, bg=HEAD_BG, font=fx, bd=0,
-                         padx=xpad, cursor='hand2')
+                         padx=pad, pady=int(3 * self.SCALE),
+                         cursor=('arrow' if _locked else 'hand2'))
+            x = tk.Label(chip, text='✕', fg=(FAINT if _locked else MUT), bg=HEAD_BG, font=fx,
+                         bd=0, padx=xpad, cursor=('arrow' if _locked else 'hand2'))
             if w > wrap:                             # one unbroken pasted blob: clamp the chip
                 chip.pack_propagate(False)           # so it cannot widen the pane — ✕ is packed
                 chip.configure(width=wrap - gap,     # first and stays visible to remove it
@@ -1333,8 +1508,9 @@ class App:
             x.pack(side='right', padx=(0, tail))     # ✕ before the text: it survives clipping
             t.pack(side='left', fill='x')
             x.bind('<ButtonRelease-1>', lambda e, sym=s: self._uni_hit(e, self._uni_remove, sym))
-            x.bind('<Enter>', lambda _e, l=x: l.configure(fg=NEG))
-            x.bind('<Leave>', lambda _e, l=x: l.configure(fg=MUT))
+            if not _locked:                          # no hover glow on a frozen chip
+                x.bind('<Enter>', lambda _e, l=x: l.configure(fg=NEG))
+                x.bind('<Leave>', lambda _e, l=x: l.configure(fg=MUT))
             t.bind('<ButtonRelease-1>', lambda e, sym=s: self._uni_hit(e, self._uni_edit, sym))
             used += w + gap
         # a silently shortened paste reads as the field eating input — say what happened.
@@ -1353,6 +1529,8 @@ class App:
         widget (drag off = cancel). The re-render slides the NEXT chip under the cursor, so
         the second press of a double-click would edit/remove an unintended pair — any chip
         action within 350ms of the previous one is that ghost, and is dropped."""
+        if getattr(self, '_settings_locked', False):     # frozen while the node runs (the chips
+            return                                       # are tk.Labels: state= can't lock them)
         try:
             if e.widget.winfo_containing(e.x_root, e.y_root) is not e.widget:
                 return
@@ -1378,6 +1556,8 @@ class App:
         the box emptying itself mid-word is what a person reads as the field losing their
         input — you watch the box you are typing in, not the chip row above it. Writing
         'XMRUSDT, XLMUSDT' and pressing Enter once is now exactly what it looks like."""
+        if getattr(self, '_settings_locked', False):
+            return None                              # session running: the basket is frozen
         try:
             raw = self._uni_raw(self.e_uni.get())
         except Exception:                            # noqa: BLE001 — teardown mid-FocusOut
@@ -1710,9 +1890,8 @@ class App:
         self._tip(self.s_fit, 'Best fitness so far — min(TRAIN, VAL) Sharpe of the top alpha.\n'
                               'Grows round by round as the search improves; TEST stays held-out\n'
                               '(see the TEST OOS column in the leaderboard).')
-        self.lbl_cur = self._lbl(pad, text='', text_color=MUT, font=(self.MONO, 12),
-                                    anchor='w', justify='left')
-        self.lbl_cur.pack(anchor='w', fill='x', pady=(12, 0))
+        # (the fitness sparkline + round-ticker strip lived here; removed on user request —
+        #  the simple screen keeps the curve, the tiles and the log carry the numbers)
         # ROUND PROGRESS — one bar per round: fills from the node's ETA model (round_eta.py),
         # resets when the next round starts. Hidden while nothing is running.
         self.round_card = self._box(pad)
@@ -1821,7 +2000,7 @@ class App:
         wrap.pack(fill='both', expand=True)
         self._lbwrap = wrap                              # smooth pixel resize (its in-card grip)
         cols = ('fav', 'rank', 'fit', 'test', 'dd', 'cagr', 'srt',
-                'tup', 'tdown', 'tflat', 'ls', 'bal', 'act', 'win', 'wup', 'wdown', 'id', 'formula')
+                'tup', 'tdown', 'tflat', 'ls', 'bal', 'act', 'wup', 'wdown', 'id', 'formula')
         self.tree = ttk.Treeview(wrap, columns=cols, show='headings',
                                  height=int(self.cfg.get('lb_rows') or 12))
         self._HEAD = {}
@@ -1837,7 +2016,6 @@ class App:
                                ('ls', 'L/S /yr·a', 100, 'center'),
                                ('bal', 'L/S %', 84, 'center'),
                                ('act', 'tr/yr·a', 72, 'e'),
-                               ('win', 'win%', 62, 'e'),
                                ('wup', 'win ↑', 64, 'e'), ('wdown', 'win ↓', 64, 'e'),
                                ('id', 'ID', 72, 'center'),
                                ('formula', 'formula', 260, 'w')):
@@ -1888,7 +2066,6 @@ class App:
                    'it scores well on TRAIN and VAL for reasons that have nothing to do\n'
                    'with the formula. The search docks fitness past 75/25 (max_net).',
             'act': 'trades per asset per year — relative activity',
-            'win': 'share of profitable days on TEST',
             'wup': 'accuracy of the formula\'s UP calls: every (bar, asset) where it\n'
                    'held a LONG position at the prior close, judged by that asset\'s\n'
                    'next bar — right when the price rose. A bar where the price didn\'t\n'
@@ -2256,17 +2433,18 @@ class App:
     def _stat(self, parent, label, col, accent=False):
         """A stat tile: big number + caption on its own soft rounded surface. `accent` marks the
         one tile the eye should land on (value in the accent colour, hairline accent border)."""
-        tile = ctk.CTkFrame(parent, fg_color=HEAD_BG, corner_radius=12,
-                            border_width=(1 if accent else 0),
-                            border_color=_mix(HEAD_BG, ACC, 0.55))
+        tile = ctk.CTkFrame(parent, fg_color=(ACC_SOFT if accent else HEAD_BG),
+                            corner_radius=12, border_width=(1 if accent else 0),
+                            border_color=_mix(ACC_SOFT, ACC, 0.45))
         tile.grid(row=0, column=col, sticky='ew', padx=(0, 12))
-        f = self._box(tile, bg=HEAD_BG)
+        bgc = ACC_SOFT if accent else HEAD_BG
+        f = self._box(tile, bg=bgc)
         f.pack(anchor='w', padx=int(16 * self.SCALE), pady=int(9 * self.SCALE))
         val = self._lbl(f, text='0', text_color=(ACC if accent else TXT),
-                        font=(self.UI, 28, 'bold'), bg=HEAD_BG, anchor='w')
+                        font=(self.UI, 28, 'bold'), bg=bgc, anchor='w')
         val.pack(anchor='w')
-        self._lbl(f, text=label.upper(), text_color=FAINT, font=(self.UI, 10, 'bold'),
-                  bg=HEAD_BG, anchor='w').pack(anchor='w')
+        self._lbl(f, text=label.upper(), text_color=(ACC if accent else FAINT),
+                  font=(self.UI, 10, 'bold'), bg=bgc, anchor='w').pack(anchor='w')
         return val
 
     # ---------- helpers ----------
@@ -2275,7 +2453,8 @@ class App:
         self.lbl_cpu.configure(text=f'{pct}%  →  {max(1, round(pct/100*CORES))} of {CORES} cores')
 
     def _reset(self):
-        keep = {k: self.cfg.get(k) for k in ('theme', 'settings_open')}   # appearance, not search
+        keep = {k: self.cfg.get(k) for k in ('theme', 'settings_open', 'ui_mode')}   # appearance,
+        #                                                                               not search
         self.cfg = dict(DEFAULTS)
         self.cfg.update(keep)
         try:
@@ -2316,7 +2495,8 @@ class App:
             return
         import glob
         removed = 0
-        wipe = ['status.json', 'portfolio.json']         # every timeframe's library/history goes too
+        wipe = ['status.json', 'portfolio.json', 'session_params.json']   # + the frozen
+        #                                       contract: a cleared node may be reconfigured freely
         for pat in ('library*.jsonl', 'history*.jsonl'):
             wipe += [os.path.basename(p) for p in glob.glob(os.path.join(STATE_DIR, pat))]
         for name in wipe:
@@ -2330,6 +2510,10 @@ class App:
                 os.remove(p)
             except OSError:
                 pass
+        import shutil
+        for p in glob.glob(os.path.join(STATE_DIR, 'series*')):   # the vault's cached return
+            if os.path.isdir(p):                                    # series (see series_cache)
+                shutil.rmtree(p, ignore_errors=True)
         try:
             os.remove(PORTFOLIO_PNG)                      # the portfolio equity image
         except OSError:
@@ -2342,7 +2526,10 @@ class App:
             self.sid_lbl.configure(text=f'session {self._session_id()}')
         except (AttributeError, tk.TclError):
             pass
-        self._reset_ui_after_wipe()
+        if self._shell_mode == 'simple':                 # the advanced reset touches widgets
+            self._sm_reset_after_wipe()                  # the simple shell never builds
+        else:
+            self._reset_ui_after_wipe()
         messagebox.showinfo('Done', 'History cleared. You can start the search from scratch.', parent=self.root)
 
     STALE_DAYS = 5                                       # snapshot older than this -> refresh at Start
@@ -2410,6 +2597,12 @@ class App:
                                 'for it to finish, then press START again.', parent=self.root)
             return
         tf = self._tf()
+        if getattr(self, '_shell_mode', 'advanced') == 'simple':
+            self._run_fetch_quiet(['--symbols', ','.join(symbols), '--interval', tf,
+                                   '--out', self._data_file()],
+                                  f'downloading {len(symbols)} pairs ({tf}) — {why}…',
+                                  on_success=on_success)
+            return
         self._run_fetch(['--symbols', ','.join(symbols), '--interval', tf,
                          '--out', self._data_file()],
                         f'Market data — {len(symbols)} pairs ({tf})',
@@ -2508,7 +2701,6 @@ class App:
         self.s_rounds.configure(text='0')
         self.s_trials.configure(text='0')
         self.s_found.configure(text='0')
-        self.lbl_cur.configure(text='')
         self._state_pill('● stopped', MUT)
         self._reset_portfolio_ui()                        # clear the Portfolio panel too
 
@@ -2533,12 +2725,113 @@ class App:
         self.v_corrp.set(c['corr_penalty']); self.v_hof.set(c['hof_capacity'])
         self.v_fitblocks.set(c.get('fit_blocks', 5))
         self.v_optwr.set(c.get('opt_winrate', False))
-        self.v_train.set(c['train_start']); self.v_val.set(c['val_start'])
-        self.v_test.set(c['test_start']); self.v_end.set(c['test_end'])
+        self.v_train.set(self._seg_disp('train_start')); self.v_val.set(self._seg_disp('val_start'))
+        self.v_test.set(self._seg_disp('test_start')); self.v_end.set(self._seg_disp('test_end'))
+
+    def _spark_paint(self, cv, base, test):
+        """The curve itself — the simple search card's chart (the advanced copy of this
+        strip was removed on user request).
+        Gridlines put NUMBERS on the shape, both endpoints carry their value, and the TEST
+        line wears the warm direction colour — the muted hairline dash was unreadable on the
+        dark theme (user-reported)."""
+        w = cv.winfo_width()
+        cv.delete('all')
+        if len(base) < 2 or w <= 1:
+            return
+        h = int(cv['height'])
+        both = base + [v for v in test if isinstance(v, (int, float))]
+        lo, hi = min(both), max(both)
+        span = max(hi - lo, 0.6)                         # a run whose best barely moves is a
+        lo -= (span - (hi - lo)) / 2                     # fact, not a line glued to the ceiling
+
+        def _xy(i, v, n):
+            return (i / (n - 1) * (w - 6) + 3,
+                    h - 4 - (v - lo) / span * (h - 8))
+        pts = [c for i, v in enumerate(base) for c in _xy(i, v, len(base))]
+        cv.create_polygon(*pts, pts[-2], h, pts[0], h,   # the soft area under the curve
+                          fill=_mix(ACC, CARD, 0.88), outline='')
+        f_tick = self._font(self.MONO, 8)
+        step = next((s for s in (0.1, 0.2, 0.25, 0.5, 1.0, 2.0, 5.0)
+                     if span / s <= 4.5), 10.0)          # a few NICE values, never a thicket
+        k = math.ceil(lo / step)
+        while k * step <= lo + span + 1e-9:
+            v = round(k * step, 2)
+            gy = h - 4 - (v - lo) / span * (h - 8)
+            cv.create_line(3, gy, w - 3, gy, fill=GRID)
+            cv.create_text(6, gy - 1, anchor='sw', text='%+g' % v, fill=MUT, font=f_tick)
+            k += 1
+        tp = [c for i, v in enumerate(test) if isinstance(v, (int, float))
+              for c in _xy(i, v, len(test))]
+        if len(tp) >= 4:
+            cv.create_line(*tp, fill=SHORTC, width=max(1, round(1.4 * self.SCALE)),
+                           dash=(4, 3))
+        cv.create_line(*pts, fill=ACC, width=max(2, round(2 * self.SCALE)))
+        x, y = _xy(len(base) - 1, base[-1], len(base))
+        r = 3.2 * self.SCALE
+        cv.create_oval(x - r, y - r, x + r, y + r, fill=ACC, outline='')
+        f_val = self._font(self.MONO, 9, 'bold')
+        ly = min(max(y, 9), h - 9)                       # clamped inside the canvas
+        cv.create_text(x - 7, ly, anchor='e', text='%+.2f' % base[-1], fill=ACC, font=f_val)
+        if len(tp) >= 4:
+            tv = next(v for v in reversed(test) if isinstance(v, (int, float)))
+            ty = min(max(tp[-1], 9), h - 9)
+            if abs(ty - ly) < 13 * self.SCALE:           # endpoints can meet — keep both readable
+                ty = ly + 13 * self.SCALE if ty >= ly else ly - 13 * self.SCALE
+            cv.create_text(tp[-2] - 7, ty, anchor='e', text='%+.2f' % tv,
+                           fill=SHORTC, font=f_val)
+
+    def _run_pill_click(self):
+        if self.proc and self.proc.poll() is None:
+            self.stop()
+            self._pill_paint(getattr(self, 'run_pill', None), 'run', None,
+                             'stopping', 'the round finishes first')
+        else:
+            self.start()
 
     def _set_running(self, running):
-        self.btn_start.configure(state='disabled' if running else 'normal')
-        self.btn_stop.configure(state='normal' if running else 'disabled')
+        for name, state in (('btn_start', 'disabled' if running else 'normal'),
+                            ('btn_stop', 'normal' if running else 'disabled')):
+            w = getattr(self, name, None)                # kept for any straggler references —
+            try:                                         # the header control is the pill now
+                if w is not None and w.winfo_exists():
+                    w.configure(state=state)
+            except tk.TclError:
+                pass
+        pill = getattr(self, 'run_pill', None)
+        if pill is not None and running != getattr(self, '_pill_running', None):
+            self._pill_running = running                 # paint on the TRANSITION only: _poll
+            if running:                                  # calls _set_running every 1.5s, and the
+                self._pill_paint(pill, 'run', None, 'running', '')   # detailed live paint follows
+            else:
+                self._pill_paint(pill, 'idle', None, 'Start node')
+        if running != getattr(self, '_settings_locked', None):
+            self._settings_locked = running              # freeze the session's parameters while
+            self._lock_settings(running)                 # the node runs — edits only after Stop
+            if hasattr(self, 'uni_chips'):
+                self._uni_render()                       # repaint chips in their locked look
+
+    def _lock_settings(self, locked):
+        """Disable every input in the settings pane while the node runs (user: no changes
+        mid-run, only after Stop). Idempotent; driven by the Start/Stop transition."""
+        inner = getattr(self, '_settings_inner', None)
+        if inner is None:
+            return
+        interactive = (ctk.CTkEntry, ctk.CTkCheckBox, ctk.CTkSlider, ctk.CTkButton,
+                       ctk.CTkOptionMenu, ctk.CTkComboBox, ctk.CTkSwitch)
+
+        def walk(w):
+            for c in w.winfo_children():
+                try:
+                    if isinstance(c, ttk.Combobox):      # readonly, not free-text, when enabled
+                        c.configure(state='disabled' if locked else 'readonly')
+                    elif isinstance(c, (ttk.Spinbox, ttk.Entry, ttk.Scale)):   # the number boxes
+                        c.configure(state='disabled' if locked else 'normal')  # (Population etc.)
+                    elif isinstance(c, interactive):
+                        c.configure(state='disabled' if locked else 'normal')
+                except tk.TclError:
+                    pass
+                walk(c)
+        walk(inner)
 
     def _state_pill(self, text, color):
         """The status pill: text + a soft wash of the state colour behind it."""
@@ -2556,7 +2849,9 @@ class App:
             t = _rtf(self.v_tf.get())
         except Exception:                                # noqa: BLE001
             return
-        seg = t.segments
+        seg = {f: _seg_res(t.name, f, 'auto')                # the new tf's auto window, as
+               for f in ('train_start', 'val_start',         # REAL dates — cfg stores the
+                         'test_start', 'test_end')}          # sentinel back on save
         self.v_train.set(seg['train_start']); self.v_val.set(seg['val_start'])
         self.v_test.set(seg['test_start']); self.v_end.set(seg['test_end'])
         self._tf_note()
@@ -2606,13 +2901,57 @@ class App:
         if lbl_seg is not None:
             try:
                 if probs:
-                    lbl_seg.configure(text='\n'.join(m for _f, m in probs))
+                    lbl_seg.configure(text='\n'.join(m for _f, m in probs), fg=NEG)
                     lbl_seg.grid()
                 else:
-                    lbl_seg.grid_remove()
-            except tk.TclError:
+                    segs = self._collect_segments()
+                    n_auto = sum(1 for v in segs.values() if v in ('auto', 'today'))
+                    if n_auto:                           # the boxes already carry the dates —
+                        lbl_seg.configure(                # the note names the MODE
+                            text=('auto window — these dates follow today; '
+                                  'edit a box to pin it' if n_auto == 4 else
+                                  f'{n_auto} of 4 dates follow today, the rest are pinned'),
+                            fg=MUT)
+                        lbl_seg.grid()
+                    else:
+                        lbl_seg.grid_remove()
+            except (tk.TclError, AttributeError):        # mid-build: not all boxes exist yet
                 pass
         return probs
+
+    def _collect_segments(self):
+        """The four date boxes -> cfg. A box left at today's auto value (or the literal
+        sentinel) is stored as the sentinel — the window keeps sliding; anything else the
+        user typed is stored verbatim — pinned."""
+        auto = self._seg_auto_now()
+        out = {}
+        for field, v in (('train_start', self.v_train), ('val_start', self.v_val),
+                         ('test_start', self.v_test), ('test_end', self.v_end)):
+            raw = v.get().strip()
+            if raw.lower() in ('auto', 'today', '') or raw == auto[field]:
+                out[field] = 'today' if field == 'test_end' else 'auto'
+            else:
+                out[field] = raw
+        return out
+
+    def _seg_auto_now(self):
+        """The active timeframe's auto window, resolved to real dates (for display and for
+        telling 'still auto' apart from 'pinned by hand')."""
+        try:
+            tf0 = _tf_clean(self.v_tf.get())
+        except (AttributeError, tk.TclError):
+            tf0 = self._tf()
+        return {f: _seg_res(tf0, f, 'auto')
+                for f in ('train_start', 'val_start', 'test_start', 'test_end')}
+
+    def _seg_disp(self, field):
+        """What a date box SHOWS: the real date (user: 'выводи, что за даты берёшь') — the
+        sentinel itself lives only in cfg, so the window keeps sliding day to day."""
+        try:
+            return _seg_res(_tf_clean(self.cfg.get('timeframe')), field,
+                            self.cfg.get(field, ''))
+        except Exception:                                # noqa: BLE001 — engine off the path
+            return str(self.cfg.get(field, ''))
 
     def _tf(self):
         """The configured bar size ('1d','4h','1h','15m'); the whole pipeline follows it."""
@@ -2631,6 +2970,96 @@ class App:
     def _lib_file(self):
         """Per-timeframe alpha library: alphas mined on different bar sizes never mix."""
         return os.path.join(STATE_DIR, f'library{_tf_suffix(self._tf())}.jsonl')
+
+    # ---------- the session contract: search parameters are frozen once a library exists ----------
+    # The dates/pairs/costs/objective a library was mined under define the MEANING of every score
+    # in it. Change them and restart, and the node would append alphas scored under a DIFFERENT
+    # rule into the same file — the leaderboard would rank apples against oranges. So once a
+    # session's library is non-empty, these parameters are locked; changing them needs a fresh
+    # node (Clear). Snapshot is per timeframe (each bar size keeps its own library).
+    CONTRACT_KEYS = (
+        ('universe_list', 'Pairs universe'),
+        ('train_start', 'TRAIN start'), ('val_start', 'VAL start'),
+        ('test_start', 'TEST start'), ('test_end', 'TEST end'),
+        ('target_vol', 'Target volatility'), ('exec_cost', 'Execution cost'),
+        ('opt_winrate', 'Objective (win-rate)'), ('fit_blocks', 'Robust-fitness blocks'),
+    )
+
+    def _contract(self):
+        """The frozen search parameters as they stand in cfg (sentinels kept raw, so an 'auto'
+        window stays 'auto' day to day and never false-conflicts)."""
+        return {k: str(self.cfg.get(k, '')) for k, _lbl in self.CONTRACT_KEYS}
+
+    def _contract_load(self):
+        try:
+            return json.load(open(SESSION_PARAMS_JSON, encoding='utf-8'))
+        except Exception:                                # noqa: BLE001 — absent/corrupt = fresh
+            return {}
+
+    def _session_conflict(self):
+        """(diffs, snapshot) — diffs is [(label, was, now), …] when the current parameters
+        disagree with the contract this timeframe's non-empty library was mined under; []
+        otherwise (a fresh/empty library, or no snapshot to honour = grandfathered)."""
+        if self._count_lines(self._lib_file()) == 0:     # nothing mined yet: any params are fine
+            return [], None
+        snap = self._contract_load().get(self._tf())
+        if not snap:
+            return [], None
+        cur = self._contract()
+        diffs = [(lbl, snap.get(k, ''), cur.get(k, ''))
+                 for k, lbl in self.CONTRACT_KEYS if str(snap.get(k, '')) != str(cur.get(k, ''))]
+        return diffs, snap
+
+    def _contract_seal(self):
+        """Record this timeframe's contract when a session begins — overwrite on a fresh
+        (empty) library so a new session may redefine it; otherwise grandfather an existing
+        library once and never move its contract afterwards."""
+        tf, snaps = self._tf(), self._contract_load()
+        if self._count_lines(self._lib_file()) == 0 or tf not in snaps:
+            snaps[tf] = self._contract()
+            try:
+                json.dump(snaps, open(SESSION_PARAMS_JSON, 'w', encoding='utf-8'), indent=1)
+            except OSError:
+                pass
+
+    def _session_conflict_dialog(self, diffs, snap):
+        """Block the restart and let the user choose: revert to the session's settings, or
+        clear the node and start fresh under the new ones."""
+        win = self._dialog('Session settings changed', '560x' + str(280 + len(diffs) * 26))
+        win.transient(self.root)
+        self.root.after(200, win.grab_set)
+        pad = self._pad(win)
+        self._lbl(pad, text='These search settings differ from the ones this library was '
+                            'mined under:', text_color=TXT, font=(self.UI, 14, 'bold'),
+                  wraplength=500, justify='left').pack(anchor='w', pady=(4, 8))
+        for lbl, was, now in diffs:
+            self._lbl(pad, text=f'•  {lbl}:   {was or "—"}   →   {now or "—"}',
+                      text_color=MUT, font=(self.MONO, 12), justify='left').pack(anchor='w')
+        self._lbl(pad, text='Mining new alphas under different rules into the same library '
+                            'corrupts the ranking. Choose how to continue:', text_color=TXT,
+                  font=(self.UI, 12), wraplength=500, justify='left').pack(anchor='w', pady=(12, 12))
+        row = self._box(pad)
+        row.pack(fill='x')
+
+        def revert():
+            self.cfg.update({k: snap.get(k, self.cfg.get(k)) for k, _l in self.CONTRACT_KEYS})
+            self._apply_cfg_to_widgets()
+            self._save()
+            self._seg_check()
+            win.destroy()
+
+        def fresh():
+            win.destroy()
+            self._wipe_history()                         # asks its own confirm; clears the snapshot
+
+        ctk.CTkButton(row, text='Revert to session settings', command=revert,
+                      fg_color=ACC, hover_color=ACC_HI, width=210).pack(side='left')
+        ctk.CTkButton(row, text='Clear node & start fresh', command=fresh,
+                      fg_color='transparent', border_width=1, border_color=NEG,
+                      text_color=NEG, width=190).pack(side='right')
+        self._lbl(pad, text='Or close this and keep editing — the node will not start until '
+                            'the settings match or the library is cleared.', text_color=FAINT,
+                  font=(self.UI, 11), wraplength=500, justify='left').pack(anchor='w', pady=(12, 0))
 
     def _tf_gate(self, what):
         """True (and explains itself) when `what` is daily-only and an intraday tf is active."""
@@ -2775,7 +3204,7 @@ class App:
                                        parent=self.root)
 
         _UI_KEYS = {'theme', 'settings_open', 'lb_mode', 'card_order', 'lb_rows', 'lb_h',
-                    'lb_cols', 'fwd_rows', 'fwd_h', 'pf_h', 'eula_accepted'}
+                    'lb_cols', 'fwd_rows', 'fwd_h', 'pf_h', 'eula_accepted', 'ui_mode'}
 
         def _details(_event=None):
             path = _sel()
@@ -2974,6 +3403,10 @@ class App:
                 '\n\n'.join(m for _f, m in probs),       # slice while reporting real-looking
                 parent=self.root)                        # Sharpes for it
             return
+        diffs, snap = self._session_conflict()           # the library's parameters are frozen:
+        if diffs:                                        # changing them mid-session would mix
+            self._session_conflict_dialog(diffs, snap)   # incomparable scores into one file
+            return
         os.makedirs(STATE_DIR, exist_ok=True)
         need, why = self._data_gap()
         if need:                                         # missing/stale/short snapshot: fetch the
@@ -3078,6 +3511,7 @@ class App:
             ALPHANODE_TRAIN_START=c['train_start'], ALPHANODE_VAL_START=c['val_start'],
             ALPHANODE_TEST_START=c['test_start'], ALPHANODE_TEST_END=c['test_end'],
         )
+        self._contract_seal()                            # this session's frozen parameters
         self.proc = subprocess.Popen(_child_cmd('node'), env=env,
                                      cwd=(apppaths.USER_DIR if apppaths.FROZEN else PROJ),
                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -3095,7 +3529,9 @@ class App:
                 self.proc.send_signal(signal.SIGINT)     # the node gently finishes the round and exits
             except Exception:
                 self.proc.terminate()
-        self.btn_stop.configure(state='disabled')
+        w = getattr(self, 'btn_stop', None)               # simple mode has no Stop button
+        if w is not None and w.winfo_exists():
+            w.configure(state='disabled')
 
     def _on_close(self):
         try:
@@ -3193,7 +3629,7 @@ class App:
 
     def _sig_save(self):
         """Persist the registry so a restarted (or crashed) GUI can find these services again."""
-        keys = ('port', 'pid', 'label', 'log', 'n_formulas', 'n_tickers', 'started')
+        keys = ('port', 'pid', 'label', 'log', 'n_formulas', 'n_tickers', 'started', 'fsig')
         try:
             json.dump([{k: s.get(k) for k in keys} for s in self._sigs],
                       open(SIGNALS_JSON, 'w', encoding='utf-8'), indent=1)
@@ -3285,12 +3721,16 @@ class App:
             return None
 
     def _serve_signal(self, formulas, label, *, tickers=None, tf=None, vol=None,
-                      exec_cost=None, start=None):
+                      exec_cost=None, start=None, quiet=False):
         """Start a signal API for `formulas`. Without the keyword args the service follows the
         panel — the active timeframe's basket, the configured vol/fee, config.ini's start —
         which is what the leaderboard and the built portfolio want. A FROZEN strategy (a
         forward-track entry) passes its own universe/tf/vol/fee/warm-up start instead, so the
-        served numbers are the bot's numbers, not whatever Settings says today."""
+        served numbers are the bot's numbers, not whatever Settings says today.
+
+        quiet=True (the simple screen's autopilot): failures come back as a short string
+        instead of a modal dialog — nothing may pop over an unattended screen. Returns
+        None on success (and on the show-existing no-op) either way."""
         # tf-aware since the intraday branch landed in signal_service (fastsim math,
         # same numbers the forward track trades) — no daily-only gate here anymore
         formulas = [f for f in (formulas or []) if f and f.strip()]
@@ -3299,6 +3739,8 @@ class App:
         tf = _tf_clean(tf) if tf else self._tf()
         tickers = list(tickers) if tickers else self._universe_tickers()
         if not tickers:
+            if quiet:
+                return f'no pairs for {tf} — download market data first'
             messagebox.showwarning('Signal API', 'The pairs universe is empty — download data '
                                    f'for the {tf} timeframe first.', parent=self.root)
             return
@@ -3307,14 +3749,18 @@ class App:
             return
         alive = sum(1 for s in self._sigs if self._sig_alive(s))
         if alive >= self.SIG_MAX:                        # each service is a whole engine process
-            messagebox.showwarning(                      # re-simulating on every refresh — ten of
-                'Signal API',                            # them is already a small server farm
+            if quiet:                                    # re-simulating on every refresh — ten of
+                return f'{alive} services running — {self.SIG_MAX} is the limit'
+            messagebox.showwarning(
+                'Signal API',
                 f'{alive} signal services are already running — {self.SIG_MAX} is the limit.\n'
                 'Free a port first (✕ Free port on a row you no longer need), '
                 'then serve this one.', parent=self.root)
             return
         port = self._free_signal_port()
         if port is None:
+            if quiet:
+                return 'no free port available'
             messagebox.showerror('Signal API', 'No free port available.', parent=self.root)
             return
         env = dict(os.environ)
@@ -3339,6 +3785,8 @@ class App:
                 cwd=(apppaths.USER_DIR if apppaths.FROZEN else PROJ),
                 stdout=fh, stderr=subprocess.STDOUT)
         except Exception as e:                            # noqa: BLE001
+            if quiet:
+                return f'could not start the signal service: {e}'
             messagebox.showerror('Signal API', f'Could not start the signal service: {e}', parent=self.root)
             return
         self._sigs.append({'port': port, 'proc': proc, 'pid': proc.pid, 'fh': fh, 'log': log_path,
@@ -3640,7 +4088,9 @@ class App:
             elif h.get('error'):
                 txt = f'⚠ {h["error"]}'
             else:                                         # first compute: show the live progress
-                txt = '⏳ ' + (h.get('progress') or 'computing the first signal…')
+                txt = '○ ' + (h.get('progress') or 'computing the first signal…')   # battle-tested glyph:
+                #  U+23F3 (hourglass) has emoji presentation and segfaults libXft 2.3.4 — the
+                #  crash.log of 2026-09-02 died one X call after painting it
         except Exception:                                 # noqa: BLE001
             txt = 'starting…'
         self._sig_health[port] = txt
@@ -3716,7 +4166,7 @@ class App:
 
     def _show_round_card(self, show):
         if show and not self._round_shown:
-            self.round_card.pack(fill='x', pady=(10, 0), after=self.lbl_cur)
+            self.round_card.pack(fill='x', pady=(10, 0), before=self._logwrap)
         elif not show and self._round_shown:
             self.round_card.pack_forget()
         self._round_shown = show
@@ -3752,7 +4202,1110 @@ class App:
         self.round_bar.set(max(0.0, min(1.0, frac)))
         self._show_round_card(True)
 
+    # ---------- Simple mode: the autopilot screen ----------
+    # A second, smaller face over the SAME machinery: the same start()/stop(), the same
+    # portfolio builder, the same serve/track calls. Exactly one branch picks the shell (the
+    # __init__ mount and _set_theme) — the previous Simple mode died as twenty scattered
+    # if-simple checks (8e83b1a), so this one is deliberately a layer, not a mode.
+
+    def _enter_advanced(self):
+        """Build the full dashboard and start its poll loop exactly once. After-loops belong
+        to root, not the shell: they survive theme rebuilds and mode switches (each loop
+        early-outs while the other shell is up), so a second start would double them."""
+        self._shell_mode = 'advanced'
+        self._build()
+        if not getattr(self, '_poll_on', False):
+            self._poll_on = True
+            self._poll()
+
+    def _switch_mode(self, mode):
+        if mode == getattr(self, '_shell_mode', 'advanced'):
+            return
+        self.cfg['ui_mode'] = mode
+        self._save()                                     # the hidden pane's vars are live — keep them
+        self._tip_hide()
+        if self._pf_resize_after:
+            self.root.after_cancel(self._pf_resize_after)
+            self._pf_resize_after = None
+        self._shell.destroy()
+        if mode == 'simple':
+            self._build_simple()
+            return
+        self._treesig = None                             # the dashboard rebuild, _set_theme-style
+        self._sig_shown = None
+        self._pf_last_w = 0
+        self._enter_advanced()
+        self._boot_arm()                                 # simple suppressed it; the dashboard wants it
+        self._set_running(bool(self.proc and self.proc.poll() is None))
+        self._render_signal_rows()
+        if self._lib_cache.get('computed'):
+            self._render_lb(self._lb_rows())
+        elif self._shown:
+            self._fill_tree(list(self._shown))
+        if self._pf_doc:
+            self._render_portfolio(self._pf_doc)
+        self.root.after(900, self._fwd_refresh)
+
+    def _build_simple(self):
+        self._shell_mode = 'simple'
+        self._sm_fetch_line = getattr(self, '_sm_fetch_line', '')
+        self._shell = self._box(self.root, bg=BG)
+        self._shell.pack(fill='both', expand=True)
+        bar = tk.Canvas(self._shell, height=3, bg=ACC, highlightthickness=0)
+        bar.pack(fill='x')
+
+        def _grad(e, cv=bar):
+            cv.delete('all')
+            n = 64
+            for i in range(n):
+                cv.create_rectangle(e.width * i / n, 0, e.width * (i + 1) / n + 1, 4,
+                                    fill=_mix(ACC, ACC_DN, i / (n - 1)), outline='')
+        bar.bind('<Configure>', _grad)
+        sm = self._sm = {}
+
+        # The full settings pane, alive but never packed, and built FIRST: the header's own
+        # timeframe box binds v_tf, and _collect()/start() dereference the rest of its ~30
+        # tk vars unconditionally — they must all exist before anything visible mounts.
+        ghost = tk.PanedWindow(self._shell, orient='horizontal', bg=BG, bd=0)
+        self._paned = ghost
+        self._build_settings(ghost)
+
+        # ---- header: brand · serving pill · pair chips · bar size · [theme, Advanced, run] ----
+        top = self._box(self._shell, bg=BG)
+        top.pack(fill='x', padx=20, pady=(12, 8))
+        brand = self._box(top, bg=BG)
+        brand.pack(side='left')
+        self._lbl(brand, text='● ', font=(self.UI, 16, 'bold'), text_color=ACC,
+                  bg=BG).pack(side='left')
+        self._lbl(brand, text='AlphaNode', font=(self.UI, 19, 'bold'), text_color=TXT,
+                  bg=BG).pack(side='left')
+        sm['brand'] = brand
+        act = ctk.CTkFrame(top, fg_color=_mix(POS, BG, 0.86), corner_radius=999)
+        self._lbl(act, text='● activated', text_color=POS, font=(self.MONO, 10),
+                  bg=_mix(POS, BG, 0.86)).pack(padx=int(9 * self.SCALE), pady=int(2 * self.SCALE))
+        sm['act_lbl'] = act                              # packed by _sm_lic_refresh, by the brand
+        self._tip(act, 'This node is activated: the library is open, serving and exports\n'
+                       'are available. If the subscription lapses, re-activate from Advanced.')
+        srv = ctk.CTkFrame(top, fg_color=_mix(POS, BG, 0.86), corner_radius=999)
+        sm['serve_pill'] = self._lbl(srv, text='', text_color=POS, font=(self.MONO, 10),
+                                     bg=_mix(POS, BG, 0.86))
+        sm['serve_pill'].pack(padx=int(9 * self.SCALE), pady=int(2 * self.SCALE))
+        sm['serve_frame'] = srv                          # packed by the tick when a service lives
+        self._build_theme_pick(top)
+        # hug the widest strings the pill ever shows (a fixed 210 read as a slab) — the
+        # same padding formula as _pill_paint's hug branch, frozen once so nothing jitters
+        h_go = int(38 * self.SCALE)
+        self._sm_go_w = int(h_go / 2 + (13 + 10 + 18) * self.SCALE
+                            + max(self._font(self.UI, 12, 'bold').measure('Start node'),
+                                  self._font(self.MONO, 9).measure('fetching market data')))
+        go = tk.Canvas(top, width=self._sm_go_w, height=h_go,
+                       bg=BG, highlightthickness=0, bd=0, cursor='hand2')
+        go.pack(side='right', padx=(0, 14))
+        go.bind('<Button-1>', lambda _e: self._simple_go())
+        sm['go'] = go
+        self._sm_paint_go('idle', None, 'Start node')
+        self._tip(go, 'Downloads market data if needed, then searches round after round.\n'
+                      'The portfolio below rebuilds after every finished round.\n'
+                      'Runs until you press Stop.')
+        b_adv = self._btn(top, '⚙  Advanced', lambda: self._switch_mode('advanced'),
+                          kind='soft', height=34, width=112)
+        b_adv.pack(side='right', padx=(0, 8))
+        b_wipe = self._btn(top, 'Clear node', self._wipe_history, kind='danger',
+                           height=34, width=100)
+        b_wipe.pack(side='right', padx=(0, 8))
+        self._tip(b_wipe, 'Delete ALL run history — found alphas, rounds, status, the built\n'
+                          'portfolio (same as Advanced → Clear all history). Asks first;\n'
+                          'settings, favorites and the forward track survive.')
+        self._tip(b_adv, 'The full dashboard: leaderboard, portfolio, forward track, signal\n'
+                         'APIs and every setting. Whatever is running keeps running.')
+        # activation lives on THIS screen too (user spec): without a key the node mines sealed —
+        # the cards show numbers instead of formulas, and nothing can be opened or served
+        sm['act_btn'] = self._btn(top, 'Activate', self._open_activate, kind='accent',
+                                  height=34, width=96)
+        self._tip(sm['act_btn'], 'Paste your subscription key once: this machine claims a node\n'
+                                 'seat, every sealed formula mined here is unlocked, and the\n'
+                                 'Signal API, Forward track and Report PDF open up.')
+        tf_box = ttk.Combobox(top, textvariable=self.v_tf, values=TF_CHOICES,
+                              state='readonly', width=4)
+        tf_box.pack(side='right', padx=(0, 12), pady=(4, 0))
+        tf_box.bind('<<ComboboxSelected>>', self._on_tf_change)
+        sm['tf_box'] = tf_box
+        self._sm_lic_refresh()                           # packs Activate / 'activated' before it
+        sm['hdr_pairs'] = self._box(top, bg=BG)
+        sm['hdr_pairs'].pack(side='right', padx=(12, 10), pady=(3, 0))
+
+        body = self._box(self._shell, bg=BG)
+        body.pack(fill='both', expand=True, padx=20, pady=(4, 16))
+
+        # ---- the pairs editor: a card summoned by the ✎ chip in the header ----
+        sm['pairs_card'] = self._card(body)
+        pp = self._pad(sm['pairs_card'])
+        self._lbl(pp, text='★ Which pairs to trade', text_color=MUT,
+                  font=(self.UI, 12, 'bold')).pack(anchor='w')
+        self._uni_build(pp)                              # mounted AFTER the ghost pane: the chip
+        #                                                  editor is a singleton, the last mount
+        #                                                  is the live one
+        self._sm_hdr_chips()
+        self.v_unilist.trace_add('write', lambda *_: self._sm_hdr_chips())
+
+        # ---- row: Search card | Champions card ----
+        row = self._box(body, bg=BG)
+        row.pack(fill='x')
+        row.columnconfigure(0, weight=11, uniform='smrow')   # the mock's 1.1fr / 1fr — and
+        row.columnconfigure(1, weight=10, uniform='smrow')   # 'uniform' makes the split RIGID:
+        #                                                      a longer formula cannot widen its
+        #                                                      card at the neighbour's expense
+        search = self._card(row)
+        search.grid(row=0, column=0, sticky='nsew')
+        sp = self._pad(search)
+        sh = self._box(sp)
+        sh.pack(fill='x')
+        sm['state'] = self._lbl(sh, text='Search — pick your pairs and press Start',
+                                text_color=TXT, font=(self.UI, 14, 'bold'))
+        sm['state'].pack(side='left')
+        sm['sr_tri'] = self._lbl(sh, text='', text_color=FAINT, font=(self.UI, 12), anchor='e')
+        sm['sr_tri'].pack(side='right')
+        spark = tk.Canvas(sp, height=int(150 * self.SCALE), bg=CARD, highlightthickness=0, bd=0)
+        spark.pack(fill='x', pady=(10, 4))
+        sm['spark'] = spark
+        self._sm_spark_sig = None
+        spark.bind('<Configure>', lambda _e: setattr(self, '_sm_spark_sig', None))
+        self._tip(spark, 'Best fitness round by round (solid) and the best held-out TEST\n'
+                         'found so far (dashed) — the same number the by-test champions top shows.')
+        leg = self._box(sp)
+        leg.pack(fill='x', pady=(0, 6))
+        self._lbl(leg, text='—', text_color=ACC, font=(self.UI, 11, 'bold')).pack(side='left')
+        self._lbl(leg, text=' best fit', text_color=MUT, font=(self.UI, 11)).pack(side='left')
+        self._lbl(leg, text='   – –', text_color=SHORTC, font=(self.UI, 11)).pack(side='left')
+        self._lbl(leg, text=' best TEST', text_color=MUT,
+                  font=(self.UI, 11)).pack(side='left')
+        tiles = self._box(sp)
+        tiles.pack(fill='x', pady=(2, 0))
+        for key, label in (('t_fit', 'best fitness'), ('t_found', 'champions'),
+                           ('t_gen', 'gen / round')):
+            cell = ctk.CTkFrame(tiles, fg_color=HEAD_BG, corner_radius=10)
+            cell.pack(side='left', padx=(0, 8), fill='x', expand=True)
+            pad2 = self._box(cell, bg=HEAD_BG)
+            pad2.pack(fill='x', padx=12, pady=8)
+            self._lbl(pad2, text=label, text_color=FAINT, font=(self.UI, 11),
+                      bg=HEAD_BG).pack(anchor='w')
+            sm[key] = self._lbl(pad2, text='—', text_color=TXT, font=(self.UI, 19, 'bold'),
+                                bg=HEAD_BG)
+            sm[key].pack(anchor='w')
+        sm['event'] = self._lbl(sp, text='', text_color=FAINT, font=(self.MONO, 10))
+        sm['event'].pack(anchor='w', pady=(8, 0))
+
+        champs = self._card(row)
+        champs.grid(row=0, column=1, sticky='nsew', padx=(12, 0))
+        cp = self._pad(champs)
+        chh = self._box(cp)
+        chh.pack(fill='x')
+        self._lbl(chh, text='Champions', text_color=TXT,
+                  font=(self.UI, 14, 'bold')).pack(side='left')
+        self._sm_champ_by = getattr(self, '_sm_champ_by', 'fit')
+        byl = self._lbl(chh, text=('by fitness' if self._sm_champ_by == 'fit' else 'by test'),
+                        text_color=ACC, font=(self.UI, 12), anchor='e', cursor='hand2')
+        byl.pack(side='right')
+        byl.bind('<ButtonRelease-1>', lambda _e: self._sm_toggle_champ_sort())
+        sm['champ_by'] = byl
+        self._tip(byl, 'Click to rank the list by TEST Sharpe instead of fitness (and back).\n'
+                       'TEST ranking shows who held up out-of-sample — remember the search\n'
+                       'never optimized for it.')
+        box = self._box(cp)
+        box.pack(fill='both', expand=True, pady=(8, 0))
+        hdr = self._box(box)
+        hdr.pack(fill='x')
+        self._lbl(hdr, text='#', text_color=FAINT, font=(self.UI, 10), width=3).pack(side='left')
+        self._lbl(hdr, text='test', text_color=FAINT, font=(self.UI, 10), width=6,
+                  anchor='e').pack(side='right')
+        self._lbl(hdr, text='fit', text_color=FAINT, font=(self.UI, 10), width=7,
+                  anchor='e').pack(side='right')
+        self._lbl(hdr, text='formula', text_color=FAINT, font=(self.UI, 10)).pack(side='left')
+        # a FIXED bank of row slots, updated in place: destroying and rebuilding rows made the
+        # card breathe with every round and the whole screen shifted under the user
+        sm['champ_slots'] = []
+        for i in range(self.SM_CHAMPS):
+            self._box(box, bg=BORDER, height=1).pack(fill='x', pady=(5, 0))
+            r = self._box(box)
+            r.pack(fill='x', pady=(4, 0))
+            self._lbl(r, text=str(i + 1), text_color=FAINT, font=(self.UI, 10),
+                      width=3).pack(side='left')
+            tl = self._lbl(r, text='', text_color=TXT, font=(self.MONO, 10, 'bold'),
+                           width=6, anchor='e')
+            tl.pack(side='right')
+            fl = self._lbl(r, text='', text_color=TXT, font=(self.MONO, 10), width=7,
+                           anchor='e')
+            fl.pack(side='right')
+            fr = self._lbl(r, text='', text_color=MUT, font=(self.MONO, 10))
+            fr.pack(side='left', fill='x', expand=True)
+            sm['champ_slots'].append((fr, fl, tl))
+        self._sm_champ_sig = None
+
+        def _champ_refit(e):                             # a WIDTH change re-fits the formulas —
+            if abs(e.width - getattr(self, '_sm_champ_w', 0)) > 24:   # with the delta guard, or
+                self._sm_champ_w = e.width               # the update itself would loop the bind
+                self._sm_champ_sig = None
+        box.bind('<Configure>', _champ_refit)
+
+        # ---- the portfolio the autopilot maintains ----
+        rep = self._card(body)
+        rep.pack(fill='x', pady=(12, 0))                 # natural height: the void below the
+        #                                                  buttons was the ugliest thing on the
+        #                                                  screen, and it said nothing
+        rp = self._pad(rep)
+        rh = self._box(rp)
+        rh.pack(fill='x')
+        sm['rep_head'] = self._lbl(rh, text='Portfolio', text_color=TXT,
+                                   font=(self.UI, 14, 'bold'))
+        sm['rep_head'].pack(side='left')
+        warn = ctk.CTkFrame(rh, fg_color=_mix(POS, CARD, 0.87), corner_radius=999)
+        warn.pack(side='left', padx=(10, 0))
+        self._lbl(warn, text='best combo · TEST clean', text_color=POS,
+                  font=(self.UI, 10, 'bold'),
+                  bg=_mix(POS, CARD, 0.87)).pack(padx=int(8 * self.SCALE),
+                                                 pady=int(2 * self.SCALE))
+        self._tip(warn, 'Members AND size (2–10) are the best combination found on\n'
+                        'TRAIN+VAL only — TEST never enters the search, so the TEST\n'
+                        'numbers below are a genuine out-of-sample evaluation.')
+        self._lbl(rh, text='rebuilds after every round', text_color=FAINT,
+                  font=(self.UI, 12), anchor='e').pack(side='right')
+        eq = tk.Canvas(rp, height=int(130 * self.SCALE), bg=CARD, highlightthickness=0, bd=0)
+        eq.pack(fill='x', pady=(10, 4))
+        sm['equity'] = eq
+        eq.bind('<Configure>', lambda _e: self._pf_doc and self._sm_draw_equity(self._pf_doc))
+        foot = self._box(rp)
+        foot.pack(fill='x', pady=(6, 0))
+        sm['serve_btn'] = self._btn(foot, '⇪  Signal API', self._pf_serve_signal,
+                                    kind='soft', height=32, width=130)
+        sm['serve_btn'].configure(state='disabled')
+        sm['serve_btn'].pack(side='left')
+        self._tip(sm['serve_btn'], 'Start a local JSON API serving this portfolio\'s live\n'
+                                   'positions — the same numbers a bot would trade.')
+        sm['pdf_btn'] = self._btn(foot, 'Report PDF', self._pf_pdf_report,
+                                  kind='soft', height=32, width=120)
+        sm['pdf_btn'].configure(state='disabled')
+        sm['pdf_btn'].pack(side='left', padx=(8, 0))
+        sm['track_btn'] = self._btn(foot, 'Forward track', self._pf_fwd_enroll,
+                                    kind='soft', height=32, width=130)
+        sm['track_btn'].configure(state='disabled')
+        sm['track_btn'].pack(side='left', padx=(8, 0))
+        self._tip(sm['track_btn'], 'Freeze this exact portfolio and paper-trade it forward on\n'
+                                   'live closed bars. Selection used TEST, so THIS is the\n'
+                                   'clean out-of-sample check.')
+        sm['rep_line'] = self._lbl(foot, text='', text_color=MUT, font=(self.MONO, 11),
+                                   anchor='e')
+        sm['rep_line'].pack(side='right')
+        sm['rep_note'] = self._lbl(rp, text='no portfolio yet — it builds itself after the '
+                                            'first round with 2+ champions',
+                                   text_color=FAINT, font=(self.UI, 11))
+        sm['rep_note'].pack(anchor='w', pady=(4, 0))
+
+        # ---- the served signal, at the bottom: the book of live positions. The canvas is
+        # registered into _sig_canvas[port], so the SAME machinery that feeds the advanced
+        # SIGNAL API card (_sig_poll_worker + the _sig_tick repaint) paints it here. ----
+        sig_card = self._card(body)                      # packed by the tick when a service lives
+        sm['sig_card'] = sig_card
+        gp = self._pad(sig_card)
+        gh = self._box(gp)
+        gh.pack(fill='x')
+        sm['sig_head'] = self._lbl(gh, text='Serving', text_color=TXT,
+                                   font=(self.UI, 14, 'bold'))
+        sm['sig_head'].pack(side='left')
+        b_all = self._btn(gh, '✕ Free all ports', self._sm_stop_all, kind='danger',
+                          height=26, width=118)             # the dashboard's twin (user spec)
+        b_all.pack(side='right')
+        self._tip(b_all, 'Stop every running signal API and release its port —\n'
+                         'yours and the autopilot\'s alike.')
+        sm['sig_status'] = self._lbl(gh, text='', text_color=MUT, font=(self.UI, 11),
+                                     anchor='e')
+        sm['sig_status'].pack(side='right', padx=(0, 12))
+        self._tip(gh, 'Up to 3 services (user cap). When the node stops, the autopilot\n'
+                      'serves the final portfolio (auto_portfolio) and the two best TEST\n'
+                      'formulas (auto_top1/2) — each replaced on the next stop only if its\n'
+                      'content changed. Services keep running after the app closes —\n'
+                      '✕ Free port stops one, ✕ Free all ports stops every one.')
+        sm['sig_rows'] = []
+        for i in range(self.SM_SIG_MAX):                 # a fixed bank, packed per service
+            fr = self._box(gp)
+            ln = self._box(fr)
+            ln.pack(fill='x')
+            hd = self._lbl(ln, text='', text_color=TXT, font=(self.UI, 12, 'bold'))
+            hd.pack(side='left')
+            self._btn(ln, '✕ Free port', lambda k=i: self._sm_free_row(k), kind='danger',
+                      height=24, width=88).pack(side='right')
+            stx = self._lbl(ln, text='', text_color=MUT, font=(self.UI, 11), anchor='e')
+            stx.pack(side='right', padx=(0, 10))
+            cv = tk.Canvas(fr, height=1, bg=CARD, highlightthickness=0, bd=0)
+            cv.pack(fill='x', pady=(6, 0))
+            cv.bind('<Configure>',
+                    lambda _e, k=i: (sm['sig_rows'][k].get('port') is not None
+                                     and self._draw_signal_positions(sm['sig_rows'][k]['port'])))
+            sm['sig_rows'].append({'fr': fr, 'hd': hd, 'st': stx, 'cv': cv, 'port': None})
+
+        doc = self._pf_doc
+        if doc is None:
+            try:
+                doc = json.load(open(PORTFOLIO_JSON, encoding='utf-8'))
+            except Exception:                            # noqa: BLE001
+                doc = None
+        if doc and doc.get('ok'):
+            self._pf_doc = doc
+            self._simple_render_report(doc)
+
+        if not getattr(self, '_fwd_tick_on', False):      # tracks enrolled here must step here
+            self._fwd_tick_on = True
+            self.root.after(20_000, self._fwd_tick)
+        if not getattr(self, '_sm_tick_on', False):
+            self._sm_tick_on = True
+            self.root.after(300, self._simple_tick)
+
+    def _sm_hdr_chips(self):
+        """The header's read-only pair chips + the ✎ that summons the editor card."""
+        box = (getattr(self, '_sm', None) or {}).get('hdr_pairs')
+        if box is None or not box.winfo_exists():
+            return
+        for w in box.winfo_children():
+            w.destroy()
+        syms = _parse_universe(self.v_unilist.get())
+        shown = syms[:6]
+        for t in shown:
+            self._lbl(box, text=t.replace('USDT', ''), text_color=MUT, font=(self.MONO, 10),
+                      bg=HEAD_BG, padx=int(7 * self.SCALE),
+                      pady=int(2 * self.SCALE)).pack(side='left', padx=(0, 4))
+        if len(syms) > len(shown):
+            self._lbl(box, text=f'+{len(syms) - len(shown)}', text_color=FAINT,
+                      font=(self.MONO, 10), bg=HEAD_BG, padx=int(6 * self.SCALE),
+                      pady=int(2 * self.SCALE)).pack(side='left', padx=(0, 4))
+        pen = self._lbl(box, text='edit', text_color=ACC, font=(self.UI, 10, 'bold'), bg=BG,
+                        cursor='hand2')
+        pen.pack(side='left', padx=(2, 0))
+        pen.bind('<ButtonRelease-1>', lambda _e: self._sm_toggle_pairs())
+        self._tip(pen, 'Edit the basket (up to 20 pairs).')
+
+    def _sm_stop_all(self):
+        """The simple card's '✕ Free all ports': the dashboard's confirm + stop, then an instant
+        repaint (the tick would catch up within 1.5 s, but a click wants an answer now)."""
+        if not self._sigs or messagebox.askyesno(
+                'Signal API', f'Stop all {len(self._sigs)} service(s) and free their ports?',
+                parent=self.root):
+            self._stop_all_signals()
+            self._sm_sig_repaint()
+
+    def _sm_free_row(self, k):
+        """'✕ Free port' on row k of the simple serving card — whichever service sits there,
+        the autopilot's or one raised on the dashboard."""
+        rows = (getattr(self, '_sm', None) or {}).get('sig_rows') or []
+        port = rows[k].get('port') if k < len(rows) else None
+        ent = next((x for x in self._sigs if x.get('port') == port), None)
+        if ent is not None:
+            self._stop_signal(ent)
+        self._sm_sig_repaint()
+
+    def _sm_sig_repaint(self):
+        """Drop the rows whose service is gone and hide the card when none is left."""
+        sm = getattr(self, '_sm', None) or {}
+        live = {x.get('port') for x in self._sigs}
+        for row in sm.get('sig_rows') or []:
+            if row.get('port') is not None and row['port'] not in live:
+                row['port'] = None
+                if row['fr'].winfo_manager():
+                    row['fr'].pack_forget()
+        card = sm.get('sig_card')
+        try:
+            if card is not None and card.winfo_exists() and not self._sigs and card.winfo_manager():
+                card.pack_forget()
+        except tk.TclError:
+            pass
+
+    def _sm_lic_refresh(self):
+        """The header's activation affordance: the Activate button on the RIGHT (before the
+        bar-size box, between Clear node and the timeframe) while this node has no
+        subscription key; once it has one, a green 'activated' pill on the LEFT, right after
+        the brand (user's placement) — the serving pill lines up after it. Re-activation
+        after a lapse stays on the Advanced screen."""
+        sm = getattr(self, '_sm', None) or {}
+        btn, lbl = sm.get('act_btn'), sm.get('act_lbl')
+        if btn is None or lbl is None or not btn.winfo_exists():
+            return
+        try:
+            if self.cfg.get('vault_license'):
+                if btn.winfo_manager():
+                    btn.pack_forget()
+                if not lbl.winfo_manager():
+                    brand = sm.get('brand')
+                    kw = {'after': brand} if (brand is not None and brand.winfo_manager()) else {}
+                    lbl.pack(side='left', padx=(10, 0), pady=(3, 0), **kw)
+            else:
+                if lbl.winfo_manager():
+                    lbl.pack_forget()
+                if not btn.winfo_manager():
+                    anchor = sm.get('tf_box')
+                    kw = {'before': anchor} if (anchor is not None and anchor.winfo_manager()) else {}
+                    btn.pack(side='right', padx=(0, 8), **kw)
+        except tk.TclError:
+            pass
+
+    def _sm_toggle_pairs(self):
+        card = (getattr(self, '_sm', None) or {}).get('pairs_card')
+        if card is None or not card.winfo_exists():
+            return
+        if card.winfo_manager():
+            card.pack_forget()
+        else:
+            card.pack(fill='x', pady=(0, 12), before=card.master.winfo_children()[1])
+
+    SM_CHAMPS = 8                                        # rows in the simple champions card
+    SM_SIG_MAX = 3                                       # services below the portfolio (user cap)
+
+    def _sm_reset_after_wipe(self):
+        """The simple shell's post-wipe reset: drop every cache the tick trusts and blank
+        the canvases the tick repaints only on change — stale pixels must not outlive
+        the files they came from."""
+        self._lib_cache = {'mtime': None, 'all': [], 'families': [], 'computing': False,
+                           'dirty': False, 'ts': 0.0, 'computed': False, 'select': None}
+        self._sm_lib = {'mtime': None, 'rows': [], 'computing': False}
+        self._pf_doc = None
+        self._sm_best_cache = []
+        self._sm_built_round = None
+        self._sm_spark_sig = None
+        self._sm_champ_sig = None
+        sm = getattr(self, '_sm', None) or {}
+        for key in ('spark', 'equity'):
+            cv = sm.get(key)
+            if cv is not None and cv.winfo_exists():
+                cv.delete('all')
+        self._sm_render_champs([])
+        self._sm_set('t_fit', '—')
+        self._sm_set('t_found', '0')
+        self._sm_set('t_gen', '—')
+        self._sm_set('sr_tri', '')
+        self._sm_set('event', '')
+        self._sm_set('rep_head', 'Portfolio', TXT)
+        self._sm_set('rep_line', '')
+        self._sm_set('rep_note', 'no portfolio yet — it builds itself after the first round '
+                                 'with 2+ champions')
+        for k in ('serve_btn', 'track_btn', 'pdf_btn'):
+            w = sm.get(k)
+            if w is not None and w.winfo_exists():
+                w.configure(state='disabled')
+
+    def _sm_auto_serve(self):
+        """The serving autopilot (user spec, rev. 3): after the node stops — never mid-run —
+        fill all three slots: the built PORTFOLIO plus the TWO best formulas by held-out
+        TEST from the library (auto_top1/auto_top2, near-clones deduped). Each is replaced
+        only when its content changed; an auto_top slot whose champion left the top is
+        stopped. A service the user raised (any other label) is never touched."""
+        jobs = []
+        pf = list((self._pf_doc or {}).get('formulas_full') or [])
+        if pf:
+            jobs.append(('auto_portfolio', pf))
+        rows = [r for r in self._sm_champ_test_rows(self.SM_CHAMPS)   # sealed rows (flagged,
+                if r[0] and not (len(r) > 3 and r[3])                 # or the old 'id:' text)
+                and not r[0].startswith('id:')]                       # are unservable
+        picked = []
+        for f in (r[0] for r in rows):
+            if all(difflib.SequenceMatcher(None, f, g).ratio() < 0.85 for g in picked):
+                picked.append(f)                         # variety, not the champion's twin
+            if len(picked) >= 2:
+                break
+        for i, f in enumerate(picked, 1):
+            jobs.append((f'auto_top{i}', [f]))
+        want = {label for label, _ in jobs}
+        if picked:                                       # a champion that left the top takes its
+            for x in list(self._sigs):                   # service along (ours by label) — but a
+                lbl = str(x.get('label') or '')          # cold library cache must not kill a
+                if lbl.startswith('auto_top') and lbl not in want:   # perfectly good service
+                    self._stop_signal(x)
+        for label, formulas in jobs:
+            cur = next((x for x in self._sigs if x.get('label') == label), None)
+            fsig = hashlib.md5('\n'.join(formulas).encode()).hexdigest()
+            if cur is not None and cur.get('fsig') == fsig and self._sig_alive(cur):
+                continue                                 # same content, still up — no churn:
+            if cur is not None:                          # a restart wastes minutes of warm-up
+                self._stop_signal(cur)
+            if sum(1 for x in self._sigs if self._sig_alive(x)) >= self.SM_SIG_MAX:
+                self._sm_set('sig_status', f'{self.SM_SIG_MAX} services are up — free a '
+                                           'port to let the autopilot serve', MUT)
+                continue
+            err = self._serve_signal(formulas, label, quiet=True)
+            if err:
+                self._sm_set('rep_note', err[:140], MUT)
+                continue
+            ent = next((x for x in self._sigs if x.get('label') == label), None)
+            if ent is not None:
+                ent['fsig'] = fsig                       # remembered across restarts (_sig_save)
+                self._sig_save()
+
+    @staticmethod
+    def _sm_locked_text(c):
+        """A sealed row's cell: the vault hides the formula, not the numbers — TEST Sharpe,
+        win rate and PnL take the place of a bare id (user spec: an unactivated node still
+        shows what each champion did). Rows mined before wr/ret were stored fall back to the
+        annualized CAGR as PnL."""
+        t = c.get('test') if isinstance(c.get('test'), dict) else {}
+        sh, wr, ret, cagr = t.get('sharpe'), t.get('wr'), t.get('ret'), t.get('cagr')
+
+        def num(v):
+            return isinstance(v, (int, float))
+        pnl = (f'PnL {ret * 100:+.0f}%' if num(ret)
+               else f'PnL {cagr * 100:+.0f}%/yr' if num(cagr) else 'PnL —')
+        return ('locked · ' + (f'Sharpe {sh:+.2f}' if num(sh) else 'Sharpe —') + ' · '
+                + (f'win {wr * 100:.0f}%' if num(wr) else 'win —') + ' · ' + pnl)
+
+    @staticmethod
+    def _sm_row(c):
+        """(text, fit, test, locked) — one champions-card row from a library / status doc."""
+        f = str(c.get('formula') or '')
+        t = c.get('test') if isinstance(c.get('test'), dict) else {}
+        return (f or App._sm_locked_text(c), c.get('base'), t.get('sharpe'), not f)
+
+    @staticmethod
+    def _sm_champ_rows(best, cap):
+        """(text, fit, test, locked) rows in the node's own fitness order — status.json's best."""
+        return [App._sm_row(c) for c in (best or [])][:cap]
+
+    def _sm_lib_kick(self):
+        """Freshness check + background (re)read of the library; returns the cache dict."""
+        lib = getattr(self, '_sm_lib', None)
+        if lib is None:
+            lib = self._sm_lib = {'mtime': None, 'rows': [], 'computing': False}
+        path = self._lib_file()
+        try:
+            mt = os.path.getmtime(path)
+        except OSError:
+            return lib
+        if mt != lib['mtime'] and not lib['computing']:
+            lib['computing'] = True
+            threading.Thread(target=self._sm_lib_compute, args=(path, mt), daemon=True).start()
+        return lib
+
+    def _sm_champ_test_rows(self, cap):
+        """Top of the LIBRARY by held-out TEST — the population the advanced table ranks when
+        its TEST OOS header is clicked. status.json's best list is the top-KEEP by FITNESS,
+        so re-sorting it would hide every high-TEST formula sitting below the fitness cut.
+        Read + ranked in a background thread, cached by the library file's mtime."""
+        return self._sm_lib_kick()['rows'][:cap]
+
+    def _sm_best_test_series(self, hist):
+        """The spark's dashed line: the best held-out TEST found SO FAR (running max over the
+        library, by discovery round) — so its endpoint agrees with the by-test top of the
+        champions table. The old line, TEST of the FITNESS champion, sat at +0.02 while the
+        table's top read +1.57 (user-reported mismatch). Until the library loads, the
+        champion's TEST from history stands in."""
+        tmax = self._sm_lib_kick().get('tmax') or []
+        if not tmax:
+            return [x.get('best_test') for x in hist]
+        out, i, run = [], 0, None
+        for x in hist:
+            r = x.get('round')
+            if isinstance(r, (int, float)):
+                while i < len(tmax) and tmax[i][0] <= r:
+                    run = tmax[i][1] if run is None else max(run, tmax[i][1])
+                    i += 1
+            out.append(run)
+        return out
+
+    def _sm_lib_compute(self, path, mtime):
+        """Mirror of _compute_lb's 'test' branch, shrunk to the card's needs: every library
+        row with a TEST number, ranked by it — no dedup, so the top matches the advanced
+        table row for row. The tick's sig check picks the fresh rows up on the next pass."""
+        rows, rmax = [], {}
+        try:
+            for line in open(path, encoding='utf-8'):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    c = json.loads(line)
+                except json.JSONDecodeError:             # a half-written last line while the node appends
+                    continue
+                t = self._LB_TESTKEY(c)
+                if t is None:
+                    continue
+                r = c.get('round')
+                r = r if isinstance(r, (int, float)) else 0
+                if t > rmax.get(r, -1e9):                # per-round best TEST, for the spark's
+                    rmax[r] = t                          # running-max line
+                rows.append(App._sm_row(c))
+        except OSError:
+            self._sm_lib.update(computing=False)
+            return
+        rows.sort(key=lambda r: r[2], reverse=True)
+        del rows[self.SM_CHAMPS * 3:]
+        self._sm_lib.update(rows=rows, mtime=mtime, computing=False,
+                            tmax=sorted(rmax.items()))
+
+    def _sm_toggle_champ_sort(self):
+        self._sm_champ_by = 'test' if getattr(self, '_sm_champ_by', 'fit') == 'fit' else 'fit'
+        lbl = (getattr(self, '_sm', None) or {}).get('champ_by')
+        if lbl is not None and lbl.winfo_exists():
+            lbl.configure(text=('by fitness' if self._sm_champ_by == 'fit' else 'by test'))
+        self._sm_champ_sig = None                        # instant re-render; library rows land
+        self._sm_render_champs(getattr(self, '_sm_best_cache', []))   # on the next tick if stale
+
+    def _sm_render_champs(self, best):
+        """Top rows of the round leaderboard, straight from status.json's best list. The row
+        widgets are a fixed bank — only their TEXT changes, so the card's size never does."""
+        slots = (getattr(self, '_sm', None) or {}).get('champ_slots') or []
+        if not slots or not slots[0][0].winfo_exists():
+            return
+        by = getattr(self, '_sm_champ_by', 'fit')
+        if by == 'test':
+            rows = self._sm_champ_test_rows(len(slots))
+            if not rows:                                 # first library read still in flight —
+                rows = sorted(self._sm_champ_rows(best, 999),   # approximate from the node's top
+                              key=lambda r: (r[2] if isinstance(r[2], (int, float)) else -1e9),
+                              reverse=True)[:len(slots)]
+        else:
+            rows = self._sm_champ_rows(best, len(slots))
+        sig = (by,) + tuple((r[0][:40], round(r[1], 3) if isinstance(r[1], (int, float)) else None,
+                             round(r[2], 2) if isinstance(r[2], (int, float)) else None)
+                            for r in rows)
+        if sig == self._sm_champ_sig:
+            return
+        self._sm_champ_sig = sig
+        f_mono = self._font(self.MONO, 10)
+        for i, (fr, fl, tl) in enumerate(slots):
+            if i >= len(rows):
+                fr.configure(text='')
+                fl.configure(text='')
+                tl.configure(text='')
+                continue
+            formula, base, test = rows[i][:3]
+            locked = len(rows[i]) > 3 and bool(rows[i][3])
+            room = max(80, fr.winfo_width() - 8)
+            fr.configure(text=self._ellipsize(f_mono, formula, room),
+                         fg=(FAINT if locked else MUT))  # a sealed row reads as numbers, dimmed
+            fl.configure(text=f'{base:+.2f}' if isinstance(base, (int, float)) else '—')
+            tcol = POS if isinstance(test, (int, float)) and test >= 1.0 else \
+                (NEG if isinstance(test, (int, float)) and test < 0 else TXT)
+            tl.configure(text=(f'{test:+.2f}' if isinstance(test, (int, float)) else '—'),
+                         fg=tcol)
+
+    def _sm_paint_go(self, kind, progress, line1, line2=''):
+        # the width MUST match the canvas from _build_simple: a wider capsule paints its
+        # right cap past the edge and the button shows up square-cornered
+        self._pill_paint((getattr(self, '_sm', None) or {}).get('go'), kind, progress,
+                         line1, line2, w=getattr(self, '_sm_go_w', None) or int(210 * self.SCALE),
+                         h=int(38 * self.SCALE))
+
+    def _pill_paint(self, cv, kind, progress, line1, line2='', w=None, h=None):
+        """The run pill (the redesign's signature control): a deep-indigo capsule with a
+        progress ring. The ring shows the REAL round progress from status.json — when the
+        model has no estimate yet, the ring simply stays a track, it never fakes a value.
+        kind: 'idle' (play glyph, accent fill) | 'run' | 'fetch' (stop glyph, run fill).
+        One painter serves both shells — the simple screen's big button and the advanced
+        header's compact one differ only in geometry."""
+        if cv is None or not cv.winfo_exists():
+            return
+        sig = (kind, progress, line1, line2)             # _poll repaints every 1.5s — identical
+        if getattr(cv, '_pill_sig', None) == sig:        # frames would flicker for nothing
+            return
+        cv._pill_sig = sig
+        S = self.SCALE
+        h = h or int(38 * S)
+        if w is None:                                    # the header pill hugs its text
+            f1 = self._font(self.UI, 12, 'bold')
+            f2 = self._font(self.MONO, 9)
+            w = int(h / 2 + 13 * S + 10 * S + max(f1.measure(line1),
+                                                  f2.measure(line2)) + 18 * S)
+            cv.configure(width=w)
+        cv.delete('all')
+        fill = ACC_FILL if kind == 'idle' else RUN_BG
+        self._capsule(cv, 0, w, h / 2, h, fill)
+        rx, r = h / 2, min(13 * S, h * 0.30)             # the ring, centred in the cap
+        if kind == 'idle':
+            cv.create_polygon(rx - 4 * S, h / 2 - 6 * S, rx - 4 * S, h / 2 + 6 * S,
+                              rx + 7 * S, h / 2, fill='#ffffff', outline='')
+        else:
+            box = (rx - r, h / 2 - r, rx + r, h / 2 + r)
+            cv.create_oval(*box, outline=RUN_RING, width=max(2, round(3 * S)))
+            if isinstance(progress, (int, float)) and 0.0 < progress <= 1.0:
+                cv.create_arc(*box, start=90, extent=-progress * 359.9, style='arc',
+                              outline=RUN_ARC, width=max(2, round(3 * S)))
+            sq = 4.5 * S
+            cv.create_rectangle(rx - sq, h / 2 - sq, rx + sq, h / 2 + sq,
+                                fill='#ffffff', outline='')
+        tx = rx + r + 10 * S
+        if line2:
+            cv.create_text(tx, h / 2 - 7 * S, text=line1, anchor='w', fill='#ffffff',
+                           font=self._font(self.UI, 12, 'bold'))
+            cv.create_text(tx, h / 2 + 9 * S, text=line2, anchor='w', fill=RUN_ARC,
+                           font=self._font(self.MONO, 9))
+        else:
+            cv.create_text(tx, h / 2, text=line1, anchor='w', fill='#ffffff',
+                           font=self._font(self.UI, 13, 'bold'))
+
+    def _sm_set(self, key, text, color=None):
+        w = (getattr(self, '_sm', None) or {}).get(key)
+        try:
+            if w is not None and w.winfo_exists():
+                w.configure(text=text, **({'fg': color} if color else {}))
+        except tk.TclError:
+            pass
+
+    def _simple_go(self):
+        p = getattr(self, '_sm_fetch_proc', None)
+        if p is not None and p.poll() is None:           # PREPARING: the button cancels the
+            try:                                         # download (tmp+replace write: a mid-
+                p.terminate()                            # write kill never corrupts the snapshot)
+            except Exception:                            # noqa: BLE001
+                pass
+            return
+        if self.proc and self.proc.poll() is None:
+            self.stop()
+        else:
+            self._sm_built_round = None                  # a fresh run rebuilds from round 1
+            self.start()
+
+    def _simple_tick(self):
+        if self._shell_mode != 'simple':
+            self._sm_tick_on = False                     # _build_simple re-arms on return
+            return
+        sm = getattr(self, '_sm', None) or {}
+        cap = sm.get('state')
+        if cap is None or not cap.winfo_exists():
+            self._sm_tick_on = False
+            return
+        running = bool(self.proc and self.proc.poll() is None)
+        building = bool(self._pf_proc and self._pf_proc.poll() is None)
+        st = {}
+        try:
+            st = json.load(open(STATUS_FILE, encoding='utf-8'))
+        except Exception:                                # noqa: BLE001
+            pass
+        live = running and st.get('state') in ('running', 'starting')   # a SIGKILLed node leaves
+        #                                                  a stale 'running' behind — the proc
+        #                                                  liveness check is what tells the truth
+        r_now = int(st.get('rounds') or 0)
+        r_max = int(self.cfg.get('max_rounds') or 0)
+        r_of = f' of {r_max}' if r_max > 0 else ''
+        if self._fetching:
+            mode, text = 'download', 'Search · downloading market data'
+        elif running and not live:
+            mode, text = 'download', 'Search · starting the engine'
+        elif running:
+            mode = 'build' if building else 'search'
+            text = f'Search · round {r_now + 1}{r_of}' + (
+                ' · updating the portfolio' if building
+                else f" · {st.get('mode') or ''}".rstrip(' ·'))
+        elif building:
+            mode, text = 'build', 'Search · building the portfolio'
+        else:
+            mode = 'idle'
+            text = ('Search · stopped — the report below is final' if self._pf_doc
+                    else 'Search — pick your pairs and press Start')
+        self._sm_set('state', text, TXT if mode != 'idle' else MUT)
+        # counters: real fields from status.json, nothing else
+        found = int(st.get('found') or 0)
+        tri = f"{st.get('trials_total', 0):,} formulas" if st else ''
+        if tri and not running and not building:
+            tri = 'stopped · ' + tri
+        self._sm_set('sr_tri', tri)
+        self._sm_set('t_found', str(found))
+        g = re.search(r'gen\s+(\d+)', st.get('gen', '') or '')
+        self._sm_set('t_gen', g.group(1) if g and running else '—')
+        self._sm_best_cache = st.get('best') or []
+        self._sm_render_champs(self._sm_best_cache)
+        hist_s = st.get('history') or []
+        sp = (getattr(self, '_sm', None) or {}).get('spark')
+        if sp is not None and sp.winfo_exists():
+            base_s = [x.get('best_base', x.get('best_test')) for x in hist_s]
+            base_s = [v for v in base_s if isinstance(v, (int, float))]
+            test_s = self._sm_best_test_series(hist_s)
+            t_last = next((v for v in reversed(test_s) if isinstance(v, (int, float))), None)
+            sig_s = (len(base_s), round(base_s[-1], 4) if base_s else None,
+                     round(t_last, 4) if t_last is not None else None, sp.winfo_width())
+            if len(base_s) >= 2 and sig_s != self._sm_spark_sig:
+                self._sm_spark_sig = sig_s
+                self._spark_paint(sp, base_s, test_s)
+        hist = st.get('history') or []
+        fit = next((h.get('best_base', h.get('best_test')) for h in reversed(hist)
+                    if h.get('best_base', h.get('best_test')) is not None), None)
+        wr = (st.get('fit_metric') == 'winrate' and isinstance(fit, (int, float))
+              and 0.0 <= fit <= 1.0)
+        self._sm_set('t_fit', '—' if fit is None else (f'{fit * 100:.0f}%' if wr else f'{fit:+.2f}'))
+        if self._fetching:
+            self._sm_set('event', (self._sm_fetch_line or '')[:120])
+        else:
+            evs = st.get('events') or []
+            if evs:
+                last = evs[-1].get('t', '')
+                if last and last != getattr(self, '_sm_ev_seen', None):
+                    self._sm_ev_seen = last
+                    self._sm_set('event', last[:120])
+        if self._fetching:
+            self._sm_paint_go('fetch', None, 'Cancel download', 'fetching market data')
+        elif running:
+            prog = st.get('progress')
+            r_line = f"round {int(st.get('rounds') or 0) + 1}"
+            sub = 'stop — fix the result'
+            if fit is not None:
+                sub = f'best {fit * 100:.0f}%' if wr else f'best {fit:+.2f}'
+            left = self._round_eta_left(st)
+            if left is not None and float(prog or 0.0) < 1.0:
+                sub += f' · {self._fmt_left(left)}'
+            self._sm_paint_go('run', (float(prog) if isinstance(prog, (int, float)) else None),
+                              r_line, sub)
+        else:
+            self._sm_paint_go('idle', None, 'Start node')
+        alive = [s2 for s2 in self._sigs if self._sig_alive(s2)]
+        frame = sm.get('serve_frame')
+        if frame is not None and frame.winfo_exists():
+            if alive:
+                self._sm_set('serve_pill',
+                             'serving ' + ' '.join(f":{s2['port']}" for s2 in alive[:3]))
+                if not frame.winfo_manager():
+                    frame.pack(side='left', padx=(10, 0), pady=(3, 0))
+            elif frame.winfo_manager():
+                frame.pack_forget()
+        card = sm.get('sig_card')
+        if card is not None and card.winfo_exists():
+            rows = sm.get('sig_rows') or []
+            show = self._sigs[:self.SM_SIG_MAX]          # PERMANENT while a service exists —
+            for i, row in enumerate(rows):               # a first signal takes minutes to
+                s2 = show[i] if i < len(show) else None  # compute, and a hidden row read
+                fr = row['fr']                           # as 'serve did nothing'
+                if s2 is None:
+                    row['port'] = None
+                    if fr.winfo_manager():
+                        fr.pack_forget()
+                    continue
+                port = s2['port']
+                if row['port'] != port:
+                    row['port'] = port                   # adopt: the shared repaint loop in
+                    self._sig_canvas[port] = row['cv']   # _sig_tick paints this canvas now
+                    self._sig_drawn.pop(port, None)      # force the first paint
+                row['hd'].configure(text=f":{port} · {s2.get('label', '')} · live positions")
+                htxt = self._sig_health.get(port, 'starting…')
+                row['st'].configure(text=htxt, fg=self._sig_status_color(htxt))
+                if not fr.winfo_manager():
+                    fr.pack(fill='x', pady=(8, 0))
+            if show:
+                self._sm_set('sig_status',
+                             f'{len(show)} of {self.SM_SIG_MAX} · re-serves after Stop')
+                if not card.winfo_manager():
+                    card.pack(fill='x', pady=(12, 0))
+            elif card.winfo_manager():
+                card.pack_forget()
+        # ---- the autopilot: every finished round refreshes the portfolio; the last word
+        # is a final build when the node stops. Never two builds at once (shared _pf_proc). ----
+        r = int(st.get('rounds') or 0)
+        if (running and r > 0 and r != getattr(self, '_sm_built_round', None)
+                and found >= 2 and not building and not self._fetching):
+            self._sm_built_round = r
+            self._simple_build_portfolio()
+        elif (getattr(self, '_sm_was_running', False) and not running and not building
+                and found >= 2):
+            self._sm_built_round = None
+            self._simple_build_portfolio()
+        self._sm_was_running = running
+        try:
+            while True:                                  # the node's stdout lands in logq and only
+                self.logq.get_nowait()                   # _poll drains it — here that duty is ours,
+        except queue.Empty:                              # or a long run grows the queue for hours
+            pass
+        self.root.after(1500, self._simple_tick)
+
+    def _simple_build_portfolio(self, n=0):
+        """The autopilot's build: the same child, the same env, the same doc file as the
+        dashboard's Build button — only the messenger differs. Selection is combo with AUTO
+        size (n=0): the builder simulates a fitness-ranked pool once, then keeps the best
+        COMBINATION of 2..10 members found on TRAIN+VAL — the size is chosen, not fixed at 6
+        (user request; ceiling 10, his cap), and TEST never enters the search, so the
+        report reads clean."""
+        if self._pf_proc and self._pf_proc.poll() is None:
+            return
+        env = dict(os.environ)
+        env.update(ALPHANODE_STATE_DIR=STATE_DIR, ALPHANODE_DATA=self._data_file(),
+                   ALPHANODE_TF=self._tf(),
+                   ALPHANODE_CONFIG_INI=apppaths.config_ini(),
+                   ALPHANODE_UNIVERSE=self.cfg.get('universe_list',
+                                                   DEFAULTS['universe_list']),
+                   ALPHANODE_TRAIN_START=self.cfg.get('train_start', ''),
+                   ALPHANODE_VAL_START=self.cfg.get('val_start', ''),
+                   ALPHANODE_TEST_START=self.cfg.get('test_start', ''),
+                   ALPHANODE_TEST_END=self.cfg.get('test_end', ''))
+        try:
+            self._pf_proc = subprocess.Popen(
+                _child_cmd('portfolio') + ['--top', str(n), '--select', 'combo',
+                                           '--out', PORTFOLIO_JSON], env=env,
+                cwd=(apppaths.USER_DIR if apppaths.FROZEN else PROJ),
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding='utf-8', errors='replace')
+        except Exception as e:                           # noqa: BLE001
+            self._sm_set('rep_note', f'portfolio build failed to start: {e}', NEG)
+            return
+        threading.Thread(target=self._simple_pf_reader, args=(self._pf_proc,),
+                         daemon=True).start()
+
+    def _simple_pf_reader(self, proc):
+        for line in iter(proc.stdout.readline, ''):
+            line = line.strip()
+            if line:
+                self.root.after(0, lambda t=line: self._sm_set('rep_note', t[:140]))
+        proc.wait()
+        self.root.after(0, self._simple_pf_done)
+
+    def _simple_pf_done(self):
+        try:
+            doc = json.load(open(PORTFOLIO_JSON, encoding='utf-8'))
+        except Exception:                                # noqa: BLE001
+            return
+        if not doc.get('ok'):
+            err = str(doc.get('error', ''))[:120]
+            self._sm_set('rep_note', 'portfolio build failed: ' + err, NEG)
+            if 'unlock' in err.lower() or 'sealed' in err.lower() or 'licence' in err.lower():
+                self._sm_set('rep_note', 'the library is sealed — activate your licence to '
+                                         'let the autopilot curate a portfolio', NEG)
+            return
+        self._pf_doc = doc
+        if self._shell_mode == 'simple':
+            self._simple_render_report(doc)
+            if not (self.proc and self.proc.poll() is None):   # the final build after Stop:
+                self._sm_auto_serve()                    # leave the services serving the last word
+
+    def _simple_render_report(self, doc):
+        m = doc.get('metrics') or {}
+        b = doc.get('basket') or {}
+        sh = m.get('sharpe')
+        sealed = bool(doc.get('sealed'))                 # vault preview: numbers, no formulas
+        self._sm_set('rep_head', f"Portfolio · {doc.get('n', '?')} alphas"
+                                 + (' · sealed preview' if sealed else ''), TXT)
+        self._sm_set('rep_line',
+                     f"test CAGR {m.get('cagr', 0) * 100:+.0f}% · "
+                     f"maxDD {m.get('dd', 0) * 100:.0f}% · "
+                     f"vs buy&hold {b.get('sharpe', 0):+.2f}",
+                     POS if (sh or 0) >= 0 else NEG)
+        self._sm_set('rep_note', ('the vault keeps the formulas sealed — this is the mix of '
+                                  'their cached return series; activate the node to open them, '
+                                  'serve the Signal API and export' if sealed else ''), MUT)
+        for k in ('serve_btn', 'track_btn'):
+            w = (self._sm or {}).get(k)
+            if w is not None and w.winfo_exists():
+                w.configure(state=('normal' if doc.get('formulas_full') else 'disabled'))
+        w = (self._sm or {}).get('pdf_btn')
+        if w is not None and w.winfo_exists():
+            w.configure(state=('normal' if doc.get('weights') else 'disabled'))
+        self._sm_draw_equity(doc)
+
+    def _sm_draw_equity(self, doc):
+        """The report's equity: the combined curve over the basket's, TEST shaded, segment
+        boundaries ticked. portfolio_build writes equity as {dates, combined, basket} and
+        bounds as the four segment DATES — everything is joined by bisecting the date list."""
+        cv = (getattr(self, '_sm', None) or {}).get('equity')
+        if cv is None or not cv.winfo_exists():
+            return
+        cv.delete('all')
+        eq = doc.get('equity') or {}
+        dates = eq.get('dates') or []
+        comb = eq.get('combined') or []
+        bask = eq.get('basket') or []
+        n = len(comb)
+        if n < 10 or len(dates) != n:
+            return
+        w, h = cv.winfo_width(), int(cv['height'])
+        if w <= 1:
+            return
+        import bisect
+        import math as _m
+
+        def _lg(v):                                      # equity compounds: log scale, or the
+            return _m.log(max(float(v), 1e-9))           # early years flatline against the peak
+        both = [_lg(v) for v in comb] + ([_lg(v) for v in bask] if len(bask) == n else [])
+        lo, hi = min(both), max(both)
+        span = (hi - lo) or 1.0
+
+        def _x(i):
+            return i / (n - 1) * (w - 2) + 1
+
+        def _pts(series):
+            out = []
+            for i, v in enumerate(series):
+                out += [_x(i), h - 3 - (_lg(v) - lo) / span * (h - 6)]
+            return out
+        bounds = doc.get('bounds') or {}
+        segs = doc.get('segments') or {}
+        vi = bisect.bisect_left(dates, str(bounds.get('val_start') or ''))
+        ti = bisect.bisect_left(dates, str(bounds.get('test_start') or ''))
+        if 0 < vi < n:                                   # train and test wear a wash, val stays
+            cv.create_rectangle(1, 0, _x(vi), h, fill=STRIPE, outline='')   # clear — the mock's
+        if 0 < ti < n:                                   # three-band read
+            cv.create_rectangle(_x(ti), 0, w, h, fill=STRIPE, outline='')
+        for key, bi in (('val_start', vi), ('test_start', ti)):
+            if 0 < bi < n:
+                cv.create_line(_x(bi), 0, _x(bi), h, fill=GRID)
+
+        def _seg_lbl(name, x):
+            sh_v = (segs.get(name) or {}).get('sharpe')
+            txt = f'{name} · {sh_v:.2f}' if isinstance(sh_v, (int, float)) else name
+            cv.create_text(x + 6 * self.SCALE, h - 4 * self.SCALE, text=txt, anchor='sw',
+                           font=self._font(self.UI, 10), fill=FAINT)
+        _seg_lbl('train', 0)
+        if 0 < vi < n:
+            _seg_lbl('val', _x(vi))
+        if 0 < ti < n:
+            _seg_lbl('test', _x(ti))
+        if len(bask) == n:                               # what holding the basket would have done
+            cv.create_line(*_pts(bask), fill=_mix(FAINT, CARD, 0.45),
+                           width=max(1, round(1.2 * self.SCALE)))
+        cv.create_line(*_pts(comb), fill=ACC, width=max(1, round(1.8 * self.SCALE)))
+
+    def _run_fetch_quiet(self, args, caption, on_success=None):
+        """Simple mode's data step: the same fetch_data child as the console dialog, but the
+        stream lands on the status line instead of a Toplevel. Cancel is the go button (a
+        terminate — the writer uses .tmp + os.replace, so a mid-write kill never corrupts
+        the snapshot). Flag semantics mirror _run_fetch exactly: _fetching for the tick,
+        cache invalidation and on_success (Tk thread, exit 0 only)."""
+        if self._fetching:
+            return
+        self._fetching = True
+        self._sm_fetch_line = caption
+        try:
+            proc = subprocess.Popen(_child_cmd('fetch') + args,
+                                    cwd=(apppaths.USER_DIR if apppaths.FROZEN else PROJ),
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True, encoding='utf-8', errors='replace')
+        except Exception as e:                           # noqa: BLE001
+            self._fetching = False
+            self._sm_fetch_line = f'download failed to start: {e}'
+            return
+        self._sm_fetch_proc = proc
+        q = queue.Queue()
+
+        def _reader():
+            for line in proc.stdout:
+                q.put(line)
+            q.put(None)
+        threading.Thread(target=_reader, daemon=True).start()
+
+        def pump():
+            try:
+                while True:
+                    line = q.get_nowait()
+                    if line is None:
+                        code = proc.poll()
+                        self._fetching = False
+                        self._sm_fetch_proc = None
+                        self._lib_cache['mtime'] = None   # fresh data: stats measured on the old
+                        self._metrics_cache = {}          # snapshot must not survive the swap
+                        self._sm_fetch_line = ('✓ data ready' if code == 0 else
+                                               f'✗ download error (code {code}) — data left '
+                                               'untouched')
+                        if code == 0 and on_success is not None:
+                            self.root.after(700, on_success)
+                        return
+                    if line.strip():
+                        self._sm_fetch_line = line.strip()[:140]
+            except queue.Empty:
+                pass
+            self.root.after(150, pump)
+        self.root.after(150, pump)
+
     def _poll(self):
+        if getattr(self, '_shell_mode', 'advanced') != 'advanced':
+            self.root.after(1500, self._poll)             # keep the loop alive across Simple —
+            return                                        # its widgets are gone, not its duty
         running = bool(self.proc and self.proc.poll() is None)
         self._set_running(running)
         st = {}
@@ -3773,20 +5326,19 @@ class App:
             self.s_rounds.configure(text=str(st.get('rounds', 0)))
             self.s_trials.configure(text=f'{st.get("trials_total", 0):,}')
             self.s_found.configure(text=str(st.get('found', len(st.get('best', [])))))
-            # the round ticker: the 'best fit | HoF' tail duplicates (and, mid-round, contradicts)
-            # the BEST FITNESS tile — drop it; elide long lines at a word, never mid-token
-            gen = (st.get('gen', '') or '').split('| best fit')[0].rstrip(' |')
-            line = (st.get('current', '') + '   ' + gen).strip()
-            left = self._round_eta_left(st) if live else None
-            if left is not None and float(st.get('progress') or 0.0) < 1.0:
-                line += f'   · {self._fmt_left(left)} left'
-            if len(line) > 140:
-                line = line[:140].rsplit(' ', 1)[0] + ' …'
-            if not live:                                 # stale config/round text must not read as
+            if live:
+                g = re.search(r'gen\s+(\d+)', st.get('gen', '') or '')
+                l1 = f"round {int(st.get('rounds') or 0) + 1}" + (f' · gen {g.group(1)}' if g else '')
+                l2 = f"{st.get('n_jobs', '?')}/{st.get('cores', '?')} cores"
+                left_p = self._round_eta_left(st)
+                if left_p is not None and float(st.get('progress') or 0.0) < 1.0:
+                    l2 += f' · {self._fmt_left(left_p)} left'
+                prog = st.get('progress')
+                self._pill_paint(getattr(self, 'run_pill', None), 'run',
+                                 (float(prog) if isinstance(prog, (int, float)) else None), l1, l2)
+            if not live:                                 # stale config text must not read as
                 res = 'last run — ' + res                # live telemetry next to a 'stopped' pill
-                line = ('last run — ' + line) if line else line
             self.lbl_res.configure(text=res, fg=MUT if live else FAINT)
-            self.lbl_cur.configure(text=line, fg=MUT if live else FAINT)
             self._update_round_bar(st, live)
             evs = st.get('events') or []
             self._maybe_render_events(evs)
@@ -3831,7 +5383,7 @@ class App:
         lambda c: (c.get('test') if isinstance(c.get('test'), dict) else {}).get('sharpe'))
 
     _SORTABLE = ('fit', 'test', 'dd', 'cagr', 'srt',
-                 'tup', 'tdown', 'tflat', 'ls', 'bal', 'act', 'win', 'wup', 'wdown', 'formula')
+                 'tup', 'tdown', 'tflat', 'ls', 'bal', 'act', 'wup', 'wdown', 'formula')
 
     @staticmethod
     def _finite(v):
@@ -3860,8 +5412,6 @@ class App:
             return m.get('long', 0) + m.get('short', 0)
         if col == 'act':
             return m.get('act')
-        if col == 'win':
-            return m.get('win')
         return None
 
     def _sorted(self, rows):
@@ -3894,9 +5444,10 @@ class App:
     PF_ROWS_MAX = 12                                     # members shown before the list scrolls
     PF_TOP_MIN, PF_TOP_MAX = 2, 20                       # what the 'top' spinner advertises
 
-    _LB_OPT_ORDER = ('id', 'dd', 'cagr', 'srt',
-                     'tup', 'tdown', 'tflat', 'ls', 'bal', 'act', 'win', 'wup', 'wdown')
-    _LB_OPT_DEFAULT = ('dd', 'cagr', 'id', 'win', 'wup', 'wdown', 'tup', 'tdown', 'tflat', 'bal')
+    _LB_OPT_ORDER = ('id', 'dd', 'cagr', 'srt',                 # no plain win%: the raw share
+                     'tup', 'tdown', 'tflat', 'ls', 'bal', 'act', 'wup', 'wdown')   # of up days
+    _LB_OPT_DEFAULT = ('dd', 'cagr', 'id', 'wup', 'wdown', 'tup', 'tdown', 'tflat', 'bal')   # read
+    #                                          as noise (~50% for every row) — dropped on request
 
     def _adv_cols(self):
         """Advanced display columns: the honest core (#/fitness/TEST/formula) plus the user's
@@ -4097,7 +5648,7 @@ class App:
             locked = bool(c.get('locked')) and not formula   # vault doc: metrics visible, text sealed
             if locked:
                 aid = str(c.get('id', ''))[:6]
-                f = '  locked — a subscription reveals the formula'
+                f = '  ' + self._sm_locked_text(c) + ' — a subscription reveals the formula'
                 m = 'err'                                # the worker can't simulate a sealed formula
             else:
                 aid = hashlib.md5(formula.encode()).hexdigest()[:6]   # cell shows the tail only: the
@@ -4117,7 +5668,7 @@ class App:
                 ('★' if aid in self._fav_ids else ''),
                 i + 1, fitcell,
                 f'{ts:+.2f}' if ts is not None else '—', dd, cagr, srt,
-                tup, tdn, tfl, ls, bal, act, win, wup, wdn, aid, f),
+                tup, tdn, tfl, ls, bal, act, wup, wdn, aid, f),
                 tags=tags)
             self._row_items[formula or ('id:' + aid)] = item
         self._lb_need_px = need + int(28 * self.SCALE)   # + cell padding / a breath of air
@@ -4183,7 +5734,7 @@ class App:
     def _pump_metrics(self):
         """After a redraw: compute the visible rows' stats. Sorting BY a stat column is the one case
         that needs every value at once (else the order is wrong), so there we compute the full set."""
-        if self._sort_col in ('ls', 'bal', 'act', 'win', 'wup', 'wdown', 'srt',
+        if self._sort_col in ('ls', 'bal', 'act', 'wup', 'wdown', 'srt',
                               'tup', 'tdown', 'tflat', 'dd', 'cagr'):
             self._start_metrics(self._shown)
         else:
@@ -4274,8 +5825,10 @@ class App:
             'formulas': list(formulas),
             'instruments': (_parse_universe(c.get('universe_list', '')) or None),
             'vol': float(c.get('target_vol', 0.25)), 'exec': float(c.get('exec_cost', 0.001)),
-            'train_start': c.get('train_start'), 'test_start': c.get('test_start'),
-            'test_end': c.get('test_end'),
+            'train_start': _seg_res(self._tf(), 'train_start', c.get('train_start')),
+            'test_start': _seg_res(self._tf(), 'test_start', c.get('test_start')),
+            'test_end': _seg_res(self._tf(), 'test_end', c.get('test_end')),
+            #                                            a frozen entry pins the real dates
         }
         env = dict(os.environ)
         env.update(ALPHANODE_STATE_DIR=STATE_DIR, ALPHANODE_DATA=self._data_file(),
@@ -4332,7 +5885,6 @@ class App:
             self.tree.set(item, 'ls', ls)
             self.tree.set(item, 'bal', bal)
             self.tree.set(item, 'act', act)
-            self.tree.set(item, 'win', win)
             self.tree.set(item, 'wup', wup)
             self.tree.set(item, 'wdown', wdn)
             self.tree.set(item, 'srt', srt)
@@ -4345,7 +5897,7 @@ class App:
                         self.tree.set(item, col, self._fmt_ratio(m.get(col), pct=True))
         if seq != self._metrics_seq:
             return
-        if self._sort_col in ('ls', 'bal', 'act', 'win', 'wup', 'wdown', 'srt',
+        if self._sort_col in ('ls', 'bal', 'act', 'wup', 'wdown', 'srt',
                               'tup', 'tdown', 'tflat', 'dd', 'cagr'):
             self._treesig = None
             self._render_lb(self._lb_rows() or self._shown)
@@ -4685,10 +6237,10 @@ class App:
         for i, c in enumerate(rows):
             formula = c.get('formula', '')
             locked = bool(c.get('locked')) and not formula
-            # locked rows: the doc's real public id, a '🔒 locked' formula cell — never the
+            # locked rows: the doc's real public id, a 'locked' formula cell — never the
             # empty-string md5 that would collide every locked row onto one bogus id
             aid = str(c.get('id', ''))[:6] if locked else hashlib.md5(formula.encode()).hexdigest()[:6]
-            fcell = '🔒 locked (subscription reveals)' if locked else formula
+            fcell = 'locked (subscription reveals)' if locked else formula
             m = self._metrics_cache.get(formula)
             m = m if isinstance(m, dict) else {}          # None = still computing, 'err' = failed -> blanks
             base = c.get('base')
@@ -4756,7 +6308,7 @@ class App:
             f = c.get('formula', '')
             # locked docs (vault mode) have no plaintext — export the public id, mark the cell
             aid = c.get('id') or hashlib.md5(f.encode()).hexdigest()[:12]
-            fcell = f if f else '🔒 locked (subscription reveals)'
+            fcell = f if f else 'locked (subscription reveals)'
             r = [aid, fcell, c.get('size', ''),
                  round(base, 4) if isinstance(base, (int, float)) else '',
                  c.get('round', ''), c.get('ts', ''), c.get('origin', 'ga')]
@@ -4862,7 +6414,10 @@ class App:
             note = ('⚠ members picked by TEST — its numbers are optimistic (cherry-pick); '
                     'validate on the forward track')
             picked = 'by TEST OOS'
-        eng = 'the real engine' if doc.get('tf', '1d') == '1d' else f'fastsim on {doc["tf"]} bars'
+        if doc.get('sealed'):                            # vault: cached return series, no plaintext
+            eng = 'cached return series (sealed preview — activate to build with the real engine)'
+        else:
+            eng = 'the real engine' if doc.get('tf', '1d') == '1d' else f'fastsim on {doc["tf"]} bars'
         span = (f'TRAIN+VAL+TEST {doc["span"]}' if doc.get('span')
                 else f'TEST {doc.get("test", "")}')     # docs built before the full-span change
         self.lbl_pf.configure(text=f'top-{doc.get("n")} {picked} combined via {eng}  ·  '
@@ -4897,11 +6452,16 @@ class App:
         if tree is None:
             return
         tree.delete(*tree.get_children())
-        lib = {c['formula']: c for c in (self._lib_cache.get('all') or []) if c.get('formula')}
         solo = doc.get('indiv_sharpe') or []
-        members = doc.get('formulas_full') or doc.get('formulas') or []
-        for i, f in enumerate(members):
-            c = lib.get(f) or {}
+        if doc.get('sealed'):                            # vault preview: the doc carries each
+            members = [(str(mm.get('id', ''))[:6], mm,   # member's id + stored metrics, no text
+                        '  ' + self._sm_locked_text(mm))
+                       for mm in (doc.get('members') or [])]
+        else:
+            lib = {c['formula']: c for c in (self._lib_cache.get('all') or []) if c.get('formula')}
+            members = [(hashlib.md5(f.encode()).hexdigest()[:6], lib.get(f) or {}, '  ' + f)
+                       for f in (doc.get('formulas_full') or doc.get('formulas') or [])]
+        for i, (aid, c, text) in enumerate(members):
             base = c.get('base')
             t = c.get('test') if isinstance(c.get('test'), dict) else {}
             ts = t.get('sharpe')
@@ -4909,13 +6469,12 @@ class App:
             beaten = (isinstance(s0, (int, float)) and isinstance(combined_sharpe, (int, float))
                       and combined_sharpe > s0)
             tree.insert('', 'end', values=(
-                i + 1,
-                hashlib.md5(f.encode()).hexdigest()[:6],
+                i + 1, aid,
                 f'{s0:+.2f}' if isinstance(s0, (int, float)) else '—',
                 ('—' if base is None else f'{base * 100:.0f}%'
                  if c.get('fit_metric') == 'winrate' else f'{base:+.2f}'),
                 f'{ts:+.2f}' if isinstance(ts, (int, float)) else '—',
-                '  ' + f),
+                text),
                 tags=(('pos',) if beaten else ('odd' if i % 2 else 'even',)))
         # The table sizes itself to the membership so the usual top-6 needs no scrolling —
         # but only up to PF_ROWS_MAX. 'top' does not enforce its own 2–20 range on a TYPED
@@ -5221,14 +6780,21 @@ class App:
                        vol_window=_t.vol_window, ewma_lambda=_t.ewma_lambda,
                        binance_interval=_t.binance_interval)
         cfg['data'] = self._data_file()
+        # the GUI's date boxes ('auto'/'today' sentinels resolved for THIS timeframe) replace the
+        # ini's [segments] — the ini knows only the daily defaults, and a chart cut at them while
+        # the leaderboard was mined on the user's TEST window mislabels every segment
+        tf_name = self._tf()
         try:
-            tr = pd.Timestamp(c['train_start'], tz='UTC'); va = pd.Timestamp(c['val_start'], tz='UTC')
-            te = pd.Timestamp(c['test_start'], tz='UTC'); en = pd.Timestamp(c['test_end'], tz='UTC')
+            def _sv(f):
+                return _seg_res(tf_name, f, c.get(f) or DEFAULTS[f])
+            tr = pd.Timestamp(_sv('train_start'), tz='UTC'); va = pd.Timestamp(_sv('val_start'), tz='UTC')
+            te = pd.Timestamp(_sv('test_start'), tz='UTC'); en = pd.Timestamp(_sv('test_end'), tz='UTC')
             cfg['splits'] = {'train': (tr, va), 'val': (va, te), 'test': (te, en)}
             cfg['start'] = tr.tz_localize(None).to_pydatetime()
             cfg['end'] = en.tz_localize(None).to_pydatetime()
-        except Exception:
-            pass
+        except Exception as e:                           # noqa: BLE001 — never silent: a chart on
+            print(f'[plot] segment dates unreadable ({type(e).__name__}: {e}) — '   # the wrong
+                  'config.ini defaults used', flush=True)                              # window lies
         return cfg
 
     def _get_market(self, cfg):
@@ -5447,8 +7013,13 @@ class App:
             if not err:
                 self.cfg['vault_license'] = token        # the key the hub actually accepted —
                 self._save()                             # saved even if the dialog is gone (the
-                self._lib_cache['ts'] = 0                # seat is claimed and the files are
-                self._treesig = None                     # already rewritten either way)
+                self._licence_adopted = False            # seat is claimed and the files are
+                try:                                     # already rewritten either way)
+                    import licence_store                 # …and shared with every other install
+                    licence_store.save(token)            # on this machine (one activation each)
+                except Exception:                        # noqa: BLE001
+                    pass
+                self._after_activation()
             if not win.winfo_exists():
                 return
             if err:
@@ -5646,7 +7217,7 @@ class App:
                           'reading steps, its position on one asset\'s price, which inputs\n'
                           'feed it (ablation), and which strategy archetype it behaves like.\n'
                           'An explanation is not evidence — TEST and forward still decide.')
-        fwd_btn = self._btn(btnrow, 'Forward track ➕',
+        fwd_btn = self._btn(btnrow, 'Forward track +',
                             lambda: self._fwd_enroll(
                                 [_f], hashlib.md5(_f.encode()).hexdigest()[:6], 'alpha'),
                             width=150)
@@ -5836,10 +7407,10 @@ class App:
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding='utf-8', errors='replace')
         except Exception as e:                                 # noqa: BLE001
-            self.lbl_fwd.configure(text=f'step failed to start: {e}')
+            self._fwd_ui('lbl_fwd', text=f'step failed to start: {e}')
             return
-        self.btn_fwd_step.configure(state='disabled')
-        self.lbl_fwd.configure(text='stepping — downloading live closed bars and running the engine…')
+        self._fwd_ui('btn_fwd_step', state='disabled')
+        self._fwd_ui('lbl_fwd', text='stepping — downloading live closed bars and running the engine…')
         threading.Thread(target=self._fwd_wait, args=(self._fwd_proc,), daemon=True).start()
 
     def _fwd_wait(self, proc):
@@ -5851,15 +7422,28 @@ class App:
 
     def _fwd_step_done(self, tail):
         try:
-            self.btn_fwd_step.configure(state='normal')
+            self._fwd_ui('btn_fwd_step', state='normal')
             self._fwd_refresh(status=tail)
         except tk.TclError:                                    # window closed while stepping
+            pass
+
+    def _fwd_ui(self, name, **kw):
+        """Touch a forward-card widget IF the dashboard is up. Steps run under the simple
+        shell too (its enroll proposal arms the same tick), where none of these exist."""
+        w = getattr(self, name, None)
+        try:
+            if w is not None and w.winfo_exists():
+                w.configure(**kw)
+        except tk.TclError:
             pass
 
     def _fwd_refresh(self, status=None):
         ft = self._fwd_lib()
         entries = [e for e in ft.load_track()['entries'] if not e.get('archived')]
         self._fwd_entries = entries
+        tree = getattr(self, 'fwd_tree', None)            # simple shell: entries updated, no table
+        if tree is None or not tree.winfo_exists():
+            return
         self._kill_cell_overlay(self.fwd_tree)
         for i in self.fwd_tree.get_children():
             self.fwd_tree.delete(i)
@@ -6064,8 +7648,10 @@ class App:
         return {
             'instruments': (_parse_universe(c.get('universe_list', '')) or None),
             'vol': float(c.get('target_vol', 0.25)), 'exec': float(c.get('exec_cost', 0.001)),
-            'train_start': c.get('train_start'), 'val_start': c.get('val_start'),
-            'test_start': c.get('test_start'), 'test_end': c.get('test_end'),
+            'train_start': _seg_res(self._tf(), 'train_start', c.get('train_start')),
+            'val_start': _seg_res(self._tf(), 'val_start', c.get('val_start')),
+            'test_start': _seg_res(self._tf(), 'test_start', c.get('test_start')),
+            'test_end': _seg_res(self._tf(), 'test_end', c.get('test_end')),
         }
 
     def _run_pdf_report(self, payload, out_path):

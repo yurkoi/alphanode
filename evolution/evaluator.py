@@ -232,6 +232,11 @@ def _metrics(r, ann=ANN):
         'dd': float((eq / eq.cummax() - 1).min()),
         'cagr': (last ** (1 / yrs) - 1) if (yrs > 0 and last > 0) else np.nan,  # wiped-out capital -> NaN, not complex
         'n': act,
+        # stored with every champion so a SEALED row (vault: formula hidden, numbers visible)
+        # can still be read: the raw win rate over ACTIVE bars — the leaderboard's own win%
+        # definition — and the segment's total return, the 'PnL' a row shows without a key
+        'wr': float((r[r != 0] > 0).mean()),
+        'ret': last - 1.0,
     }
 
 

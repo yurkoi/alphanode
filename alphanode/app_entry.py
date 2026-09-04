@@ -167,7 +167,7 @@ def _selfcheck_body(out):
     # Forward-track state must land in the WRITABLE user dir, never inside the bundle: the GUI
     # imports forward_track IN-PROCESS (ALPHANODE_STATE_DIR is only set for child processes), and
     # frozen __file__ points into the read-only AppImage/deb — the old "state next to the module"
-    # fallback made every "Forward track ➕" click die silently inside the Tk callback.
+    # fallback made every "Forward track +" click die silently inside the Tk callback.
     import forward_track
     _fd = forward_track._state_dir()
     if apppaths.FROZEN and not os.environ.get('ALPHANODE_STATE_DIR'):

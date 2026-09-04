@@ -229,6 +229,46 @@ def _disk_doc(c):
     d['id'] = vault.formula_id(c['formula'])
     d['formula_enc'] = vault.seal(c['formula'], VAULT_PUB, owner=VAULT_OWNER)
     return d
+
+
+def _pub_id(c):
+    """A doc's 12-hex public id: the stored one for a sealed row, the formula's md5 tail (the
+    very same value — see vault.formula_id) for plaintext. The series cache is keyed by it."""
+    if c.get('id'):
+        return str(c['id'])
+    f = c.get('formula') or ''
+    return hashlib.md5(f.encode()).hexdigest()[:12] if f else ''
+
+
+def _cache_series(cfg, items):
+    """Vault mode: the portfolio builder (another process) cannot simulate a sealed row, so it
+    is handed the row's NET return series instead — see series_cache: no forward signal in it,
+    nothing to trade, but enough to search the best combination and score the mix, which is
+    what an unactivated node's Portfolio card shows. One fastsim per new champion on this
+    round's own panel (the same engine and window the search scored it with); the cache then
+    follows the top rows by fitness so it never outgrows a few tens of MB. Returns the count
+    cached; a failure is logged and the round goes on — this is a preview aid, not the search."""
+    try:
+        import series_cache
+        from genome import parse
+        from evaluator import build_panel, make_market, simulate_returns
+        tk, raw, panel = build_panel(cfg['data'], cfg['start'], cfg['end'],
+                                     cfg.get('instruments'), freq=cfg.get('freq', 'D'))
+        market = make_market(panel, tk, raw, vol_window=cfg.get('vol_window', 30))
+        n = 0
+        for fid, formula in items:
+            r = simulate_returns(parse(formula), tk, panel, market, cfg['vol'], cfg['exec'],
+                                 ann=cfg.get('ann', 365), ewma_lambda=cfg.get('ewma_lambda', 0.06))
+            if r is None:
+                continue
+            series_cache.save(series_cache.path(STATE_DIR, TF, fid), r)
+            n += 1
+        keep = sorted(lib_rank, key=lambda k: lib_rank[k])[:series_cache.KEEP]   # the active
+        series_cache.prune(STATE_DIR, TF, keep)                # objective first, then fitness
+        return n
+    except Exception as e:                               # noqa: BLE001
+        log_event('warn', f'⚠ return-series cache skipped: {type(e).__name__}: {e}')
+        return 0
 CORES = os.cpu_count() or 4
 N_JOBS = max(1, round(CPU_PERCENT / 100 * CORES))      # resources -> number of parallel workers
 
@@ -286,6 +326,8 @@ def log_event(kind, text):
 seen = set()
 leaderboard = []
 history = []
+lib_rank = {}                                          # public id -> _rank_key, EVERY library row
+#                                                        (the series cache is pruned to its top)
 
 
 def _testsh(c):
@@ -319,6 +361,8 @@ def load_existing():
                 # reverse) is still caught without a second key here.
                 seen.add(c['formula'] if c.get('formula') else 'id:' + str(c.get('id', '')))
                 leaderboard.append(c)
+                if _pub_id(c):
+                    lib_rank[_pub_id(c)] = _rank_key(c)
             except json.JSONDecodeError:
                 pass
     leaderboard.sort(key=_rank_key)                    # active objective first, then fitness;
@@ -403,6 +447,10 @@ def _override(cfg, key, name, cast):
 def _apply_segments(cfg):
     order = ('TRAIN_START', 'VAL_START', 'TEST_START', 'TEST_END')
     raw = {k: _envset(k) for k in order}
+    if any(raw.values()):
+        from timeframe import seg_value              # 'auto'/'today' -> real dates for this tf
+        raw = {k: (seg_value(cfg.get('tf', '1d'), k.lower(), v) if v else None)
+               for k, v in raw.items()}
     if not any(raw.values()):
         return
     sp = cfg['splits']
@@ -455,7 +503,7 @@ def _html_formula(c):
     shows the public id, never plaintext; the in-memory leaderboard keeps plaintext for refine
     seeding, so masking has to happen at render time, not just on the file write."""
     if VAULT_PUB is not None or c.get('locked') or not c.get('formula'):
-        return '🔒 locked · ' + str(c.get('id', ''))[:12]
+        return 'locked · ' + str(c.get('id', ''))[:12]   # no emoji: colour glyphs crash Xft in the GUI
     return c['formula']
 
 
@@ -801,6 +849,7 @@ def main():
         _eta[0] = None
         status.update(eta_s=0, eta_at=time.time(), progress=1.0, gen_i=GENS)
         new = 0
+        fresh = []                                     # (public id, plaintext) of this round's finds
         with open(LIB, 'a', encoding='utf-8') as f:
             for c in champions_from_hof(hof, metric=cfg.get('fit_metric', 'sharpe')):
                 if c['formula'] in seen or _id_key(c['formula']) in seen:
@@ -809,9 +858,16 @@ def main():
                 c['round'], c['ts'] = rnd, iso()
                 f.write(json.dumps(_disk_doc(c), ensure_ascii=False) + '\n')
                 leaderboard.append(c)                    # memory keeps plaintext (refine seeding)
+                lib_rank[_pub_id(c)] = _rank_key(c)
+                fresh.append((_pub_id(c), c['formula']))
                 new += 1
         leaderboard.sort(key=_rank_key)                # champion = best under the ACTIVE objective;
         del leaderboard[KEEP:]                         # TEST closed
+        if VAULT_PUB is not None and fresh:            # sealed rows: the builder gets their return
+            status['current'] = (f'round {rnd}: caching {len(fresh)} return series for the '
+                                 'sealed portfolio…')   # series, never the formula
+            save_status()
+            _cache_series(cfg, fresh)
         champ = leaderboard[0] if leaderboard else None
         bb = _basesh(champ) if champ else None          # optimized fitness
         bt = _testsh(champ) if champ else None          # honest held-out OOS of the same champion (read-only)
