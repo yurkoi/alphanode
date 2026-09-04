@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Timeframes — AlphaNode Docs</title>
+<link rel="stylesheet" href="../style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⛏️</text></svg>">
+</head>
+<body>
+
+<nav>
+  <div class="wrap">
+    <a class="logo" href="../index.html">Alpha<b>Node</b></a>
+    <div class="links">
+      <a href="quickstart.html">Quickstart</a>
+      <a href="gui.html">GUI guide</a>
+      <a href="timeframes.html">Timeframes</a>
+    </div>
+    <a class="btn small" href="../index.html#pricing">Get AlphaNode</a>
+  </div>
+</nav>
+
+<div class="doc wrap">
+  <div class="crumbs"><a href="../index.html">Home</a> / Docs / Timeframes</div>
+  <h1>Timeframes</h1>
+  <p>The whole pipeline — data, search, metrics, portfolio — follows one bar-size
+  setting. Everything that depends on the bar size (annualization, volatility windows,
+  calendar grid, funding aggregation) is adjusted automatically; daily behaviour reproduces
+  the classic daily engine exactly.</p>
+
+  <h2>Recommended windows</h2>
+  <p>Finer bars are denser and heavier, so the recommended history window shrinks as bars get
+  finer while still spanning several market regimes. Picking a timeframe in the GUI fills
+  these in as editable defaults:</p>
+  <table>
+    <tr><th>Bar</th><th>History from</th><th>VAL from</th><th>TEST from</th><th>Max pairs</th><th>Bars / year</th></tr>
+    <tr><td><code>1d</code></td><td>2019-09</td><td>2021-11</td><td>2023-01</td><td>150</td><td>365</td></tr>
+    <tr><td><code>4h</code></td><td>2020-06</td><td>2023-01</td><td>2024-09</td><td>100</td><td>2 190</td></tr>
+    <tr><td><code>1h</code></td><td>2022-06</td><td>2024-06</td><td>2025-06</td><td>60</td><td>8 760</td></tr>
+    <tr><td><code>15m</code></td><td>2024-01</td><td>2025-04</td><td>2025-12</td><td>40</td><td>35 040</td></tr>
+  </table>
+  <p>Crypto trades 24/7, so a year is 365 calendar days of bars — Sharpe ratios across
+  timeframes are annualized consistently and stay comparable.</p>
+
+  <h2>Per-timeframe isolation</h2>
+  <p>Each bar size keeps its <b>own</b> data snapshot, its own alpha library and its own
+  search history. Alphas mined on 1h bars never mix with daily ones — a formula's metrics
+  always mean "on this bar size".</p>
+
+  <h2>Two engines, one meaning</h2>
+  <p>AlphaNode deliberately runs two simulator implementations:</p>
+  <table>
+    <tr><th>Where</th><th>Engine</th><th>Why</th></tr>
+    <tr><td>Search, leaderboard, intraday portfolio</td>
+      <td>fastsim — a compiled numpy port</td>
+      <td>~100× faster; its numbers are exactly what the search optimized, on any bar size.</td></tr>
+    <tr><td>Daily portfolio, paper bundle, signal API</td>
+      <td>the real pandas engine</td>
+      <td>Matches the paper/serve products bar-for-bar.</td></tr>
+  </table>
+  <p>The two agree closely (return correlation ≥ 0.99; the portfolio layer adds a second
+  vol-targeting pass, so weights can differ by a few percent) — and the GUI always labels
+  which engine produced the numbers you're looking at.</p>
+
+  <h2>Funding is a first-class feature</h2>
+  <p>Perpetual funding payments are downloaded with the price history and aggregated into
+  each bar as a flow. They enter the simulation P&amp;L (longs pay positive funding) and are
+  available to formulas as the <code>funding</code> terminal — so carry harvesting and
+  funding-momentum alphas are part of the search space, on every timeframe.</p>
+
+</div>
+
+<footer>
+  <div class="wrap">
+    <div>© 2026 AlphaNode · hypothetical backtests, not investment advice.</div>
+    <div><a href="../index.html">Home</a> · <a href="mailto:yurbusht@gmail.com">Contact</a></div>
+  </div>
+</footer>
+
+<script src="../app.js" defer></script>
+</body>
+</html>

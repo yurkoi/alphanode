@@ -1,0 +1,9 @@
+# AlphaNode marketing + docs site (static, nginx).
+#   DOCKER_CONFIG=$(mktemp -d) docker compose up -d --build
+# Serves on http://localhost:8880 — put your domain/https proxy in front.
+services:
+  site:
+    build: .
+    ports:
+      - "8880:80"
+    restart: unless-stopped

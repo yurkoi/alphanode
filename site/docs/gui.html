@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GUI Guide — AlphaNode Docs</title>
+<link rel="stylesheet" href="../style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⛏️</text></svg>">
+</head>
+<body>
+
+<nav>
+  <div class="wrap">
+    <a class="logo" href="../index.html">Alpha<b>Node</b></a>
+    <div class="links">
+      <a href="quickstart.html">Quickstart</a>
+      <a href="gui.html">GUI guide</a>
+      <a href="timeframes.html">Timeframes</a>
+    </div>
+    <a class="btn small" href="../index.html#pricing">Get AlphaNode</a>
+  </div>
+</nav>
+
+<div class="doc wrap">
+  <div class="crumbs"><a href="../index.html">Home</a> / Docs / GUI guide</div>
+  <h1>GUI guide</h1>
+  <p>The desktop app is a settings sidebar on the left and a live dashboard on the right.
+  The split, the chart height and the portfolio panel height are all draggable — grab the
+  gaps between blocks; double-click a handle to reset.</p>
+
+  <h2>Search settings (sidebar)</h2>
+  <ul>
+    <li><b>Timeframe</b> — the bar size for the whole pipeline. Picking one fills in the
+      recommended date segments and pair count. Each timeframe keeps its own data snapshot,
+      library and history — they never mix.</li>
+    <li><b>Universe</b> — all downloaded pairs, or an explicit comma-separated list.</li>
+    <li><b>Segments</b> — TRAIN / VAL / TEST boundaries. TEST is the held-out window: the
+      search never selects by it.</li>
+    <li><b>Simulation</b> — target volatility and execution cost (fees+slippage per side).</li>
+    <li><b>GA parameters</b> — population, generations per round, tournament size, elitism,
+      random injection, crossover probability, parsimony (complexity penalty), correlation
+      threshold/penalty, Hall-of-Fame capacity.</li>
+  </ul>
+
+  <h2>Dashboard</h2>
+  <h3>Status + progress chart</h3>
+  <p>Round and generation counters, evaluation speed, a live activity log, and the
+  best-fitness curve of the current round.</p>
+
+  <h3>Leaderboard</h3>
+  <p>The alpha library ranked by your chosen column. Colums include size, fitness
+  (min TRAIN/VAL Sharpe), and Sharpe / MaxDD / CAGR / bars per segment. The row context
+  menu and toolbar let you:</p>
+  <ul>
+    <li>copy a formula, or plot its full equity curve;</li>
+    <li>export the library to <b>CSV</b>;</li>
+    <li>generate a <b>PDF</b> analytics report;</li>
+    <li>serve the alpha as a live <b>signal API</b> (daily).</li>
+  </ul>
+
+  <h3>Portfolio</h3>
+  <p>Combines the library's top-N into one book and shows combined TEST metrics vs an
+  equal-weight buy-&amp;-hold basket, plus the equity chart. Two selection modes:</p>
+  <table>
+    <tr><th>Mode</th><th>Picks by</th><th>Meaning of the combined TEST numbers</th></tr>
+    <tr><td><code>TEST</code></td><td>held-out TEST Sharpe</td>
+      <td>Optimistic (the same window picked the members — a cherry-pick). Treat as a
+      shortlist; validate forward.</td></tr>
+    <tr><td><code>fitness</code></td><td>min(TRAIN, VAL) Sharpe</td>
+      <td>Honest out-of-sample: TEST never entered selection.</td></tr>
+  </table>
+  <p>On daily bars the combination runs through the real portfolio engine (identical to the
+  paper/serve products); intraday it runs through the search engine with the same combiner
+  semantics — the label under the metrics always tells you which.</p>
+
+  <h2>Data &amp; processes</h2>
+  <p><b>Download data</b> fetches/refreshes the per-timeframe snapshot. The node, signal
+  services, portfolio builds and PDF reports run as separate background processes — the GUI
+  stays responsive, survives restarts, and re-adopts running services on launch.</p>
+
+  <div class="note">All state lives in one folder (settings, per-timeframe libraries, search
+  history, portfolio docs). "Wipe history" in the settings clears search artifacts but never
+  touches your data snapshots.</div>
+</div>
+
+<footer>
+  <div class="wrap">
+    <div>© 2026 AlphaNode · hypothetical backtests, not investment advice.</div>
+    <div><a href="../index.html">Home</a> · <a href="mailto:yurbusht@gmail.com">Contact</a></div>
+  </div>
+</footer>
+
+<script src="../app.js" defer></script>
+</body>
+</html>

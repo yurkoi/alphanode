@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Quickstart — AlphaNode Docs</title>
+<link rel="stylesheet" href="../style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⛏️</text></svg>">
+</head>
+<body>
+
+<nav>
+  <div class="wrap">
+    <a class="logo" href="../index.html">Alpha<b>Node</b></a>
+    <div class="links">
+      <a href="quickstart.html">Quickstart</a>
+      <a href="gui.html">GUI guide</a>
+      <a href="timeframes.html">Timeframes</a>
+    </div>
+    <a class="btn small" href="../index.html#pricing">Get AlphaNode</a>
+  </div>
+</nav>
+
+<div class="doc wrap">
+  <div class="crumbs"><a href="../index.html">Home</a> / Docs / Quickstart</div>
+  <h1>Quickstart</h1>
+  <p>From a fresh install to your first mined alphas in about fifteen minutes — most of it
+  unattended.</p>
+
+  <h2>1. Install</h2>
+  <ul>
+    <li><b>Linux:</b> download <code>AlphaNode-x86_64.AppImage</code>, make it executable
+      (<code>chmod +x</code>), run. A <code>.deb</code> package is also available.</li>
+    <li><b>Windows:</b> run <code>AlphaNode-Setup.exe</code>, or unzip the portable build
+      anywhere and run <code>AlphaNode.exe</code>.</li>
+  </ul>
+  <p>The app ships with a starter data snapshot (50 pairs, daily bars), so the search works
+  out of the box before you download anything.</p>
+
+  <h2>2. Pick a timeframe and download data</h2>
+  <p>In <b>SEARCH SETTINGS</b>, choose the bar size — <code>1d</code>, <code>4h</code>,
+  <code>1h</code> or <code>15m</code>. Picking one auto-fills the recommended history window
+  and pair count for that bar size (see <a href="timeframes.html">Timeframes</a>). Then press
+  <b>Download data</b>: the node fetches OHLCV + funding history for the top Binance USDT-perp
+  pairs into a per-timeframe snapshot. Daily data takes a couple of minutes; 15m takes longer
+  — the app shows progress.</p>
+
+  <h2>3. Start the node</h2>
+  <p>Press <b>▶ Start</b>. The node runs continuous search rounds: each round evolves a
+  population of formulas for a configured number of generations, then merges the champions
+  into your <b>alpha library</b>. You'll see:</p>
+  <ul>
+    <li>the live status line (round, generation, evaluations/sec);</li>
+    <li>the progress chart (best fitness per generation);</li>
+    <li>the <b>leaderboard</b> — the library's top alphas with TRAIN / VAL / TEST metrics.</li>
+  </ul>
+  <div class="note">TEST numbers are shown for information only — the search never selects by
+  them. A good habit: sort by TEST once a day, not every five minutes.</div>
+
+  <h2>4. Build a portfolio</h2>
+  <p>In the <b>PORTFOLIO</b> panel set <code>top N</code> and press <b>Build portfolio</b>.
+  The builder picks the top-N diverse alphas from the library and combines them through the
+  engine's portfolio layer (second vol-targeting pass + position inertia). You get combined
+  TEST metrics vs buy-&amp;-hold, an equity chart, and per-bar target weights.</p>
+
+  <h2>5. Act on it</h2>
+  <ul>
+    <li><b>CSV</b> — download per-bar target weights of the combined portfolio.</li>
+    <li><b>PDF</b> — a full analytics report (equity, drawdown, exposure, per-alpha stats).</li>
+    <li><b>Signal API</b> — serve the current target positions as a local JSON endpoint (daily).</li>
+    <li><b>Paper bundle</b> — export a self-contained paper-trading kit (daily).</li>
+  </ul>
+
+  <h2>Running headless (CLI)</h2>
+  <p>Everything the GUI does, scripted — for servers, ssh or Docker:</p>
+  <pre><code># continuous search, 50% CPU, population 200, 25 generations per round
+alphanode run --cpu 50 --pop 200 --gens 25
+
+# inspect the library
+alphanode top --sort test --min-test 1
+alphanode status</code></pre>
+
+  <div class="note warn">Everything AlphaNode shows is a hypothetical backtest, not investment
+  advice. Verify any alpha with a forward/paper run on new data before it means anything.</div>
+
+  <div class="docgrid">
+    <div class="card"><h3><a href="gui.html">GUI guide →</a></h3><p>Every panel and button.</p></div>
+    <div class="card"><h3><a href="timeframes.html">Timeframes →</a></h3><p>Bar sizes, windows, engines.</p></div>
+  </div>
+</div>
+
+<footer>
+  <div class="wrap">
+    <div>© 2026 AlphaNode · hypothetical backtests, not investment advice.</div>
+    <div><a href="../index.html">Home</a> · <a href="mailto:yurbusht@gmail.com">Contact</a></div>
+  </div>
+</footer>
+
+<script src="../app.js" defer></script>
+</body>
+</html>
