@@ -4415,8 +4415,43 @@ class App:
         sm['hdr_pairs'] = self._box(top, bg=BG)
         sm['hdr_pairs'].pack(side='right', padx=(12, 10), pady=(3, 0))
 
-        body = self._box(self._shell, bg=BG)
-        body.pack(fill='both', expand=True, padx=20, pady=(4, 16))
+        # The simple screen SCROLLS like the dashboard column (user spec: the right-edge
+        # scroller is mandatory here too): on a short window the cards keep their natural
+        # heights and the bar moves between blocks; on a tall one the inner frame stretches
+        # to the viewport. Same change-guarded fit as _build_status — an unguarded refit
+        # from <Configure> would loop the layout (the 08-18 storm).
+        wrap = self._box(self._shell, bg=BG)
+        wrap.pack(fill='both', expand=True, padx=(20, 8), pady=(4, 16))
+        smcv = tk.Canvas(wrap, bg=BG, highlightthickness=0)
+        vsb = ctk.CTkScrollbar(wrap, orientation='vertical', command=smcv.yview,
+                               fg_color=BG, button_color=BORDER, button_hover_color=FAINT,
+                               width=12)
+        smcv.configure(yscrollcommand=vsb.set)
+        vsb.pack(side='right', fill='y', padx=(6, 0))
+        smcv.pack(side='left', fill='both', expand=True)
+        body = self._box(smcv, bg=BG)
+        item = smcv.create_window((0, 0), window=body, anchor='nw')
+
+        def _sm_fit(_e=None):
+            w, h = smcv.winfo_width(), smcv.winfo_height()
+            H = max(h, body.winfo_reqheight())
+            if (w, H) == getattr(smcv, '_fit_last', None):
+                return
+            smcv._fit_last = (w, H)
+            smcv.itemconfigure(item, width=w, height=H)
+            smcv.configure(scrollregion=(0, 0, w, H))
+        smcv.bind('<Configure>', _sm_fit)
+        body.bind('<Configure>', _sm_fit)
+
+        def _sm_fit_watch():
+            # late height changes (portfolio chart render, CTk relayout) don't fire Configure
+            # on the pinned frame — poll the request cheaply, as the dashboard column does
+            if not smcv.winfo_exists():
+                return
+            _sm_fit()
+            smcv.after(400, _sm_fit_watch)
+        smcv.after(400, _sm_fit_watch)
+        self._bind_wheel(smcv, through=True)
 
         # ---- the pairs editor: a card summoned by the ✎ chip in the header ----
         sm['pairs_card'] = self._card(body)
