@@ -52,6 +52,29 @@ import customtkinter as ctk
 # into a plain no-offset drag instead of a traceback.
 ctk.CTkScrollbar._motion_center_offset = 0
 
+# CTk 6.0.0's CTkScrollbar._draw ends with canvas.update_idletasks() — a NESTED pump of the
+# event queue from inside a redraw. Every scrolled widget posts its scrollbar refresh as an
+# idle task, so with several scrollbars the pumps feed each other and any layout feedback
+# becomes a stack storm: 3868 callbacks died with RecursionError in 25s at idle (measured
+# 2026-08-18). The pump adds nothing — Tk repaints at idle anyway — so neutralize it for the
+# duration of the draw. Version-tolerant: once CTk drops the pump this is a no-op.
+_ctk_sb_draw = ctk.CTkScrollbar._draw
+
+
+def _sb_draw_no_pump(self, *a, **kw):
+    cv = self._canvas
+    cv.update_idletasks = lambda: None                   # shadow the method for this call only
+    try:
+        _ctk_sb_draw(self, *a, **kw)
+    finally:
+        try:
+            del cv.update_idletasks                      # un-shadow: back to the real Tk method
+        except AttributeError:
+            pass
+
+
+ctk.CTkScrollbar._draw = _sb_draw_no_pump
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)                             # for import apppaths on direct launch
@@ -401,6 +424,29 @@ class App:
             self._boot_arm()                             # With a splash up its dialog must not pop
         #                                                  mid-intro — finish() arms it instead.
         root.protocol('WM_DELETE_WINDOW', self._on_close)
+        if sys.platform == 'darwin':                      # Cmd+Q / menu Quit bypass WM_DELETE_WINDOW:
+            try:                                          # Aqua Tk calls this proc instead — route it
+                root.createcommand('::tk::mac::Quit', self._on_close)   # to the same shutdown path
+            except Exception:                             # noqa: BLE001
+                pass
+        # Tk's TkMacOSXSignalHandler answers a stray SIGTERM/SIGHUP (e.g. a broad `pkill AlphaNode`
+        # aimed at old nodes) with Tcl_Exit STRAIGHT FROM THE SIGNAL TRAMPOLINE: the interp is torn
+        # down mid-bytecode, teardown re-enters the event loop and Python aborts on a NULL tstate
+        # (crashed in production 2026-08-18). A Python-level handler replaces Tk's; deferring to the
+        # orderly close path on the Tk loop turns the same signal into a clean quit.
+        def _sig_close(*_a):
+            if not getattr(self, '_closing', False):
+                self._closing = True
+                try:
+                    self.root.after(0, self._on_close)
+                except Exception:                         # noqa: BLE001 — window already gone
+                    pass
+        for _s in (signal.SIGTERM, signal.SIGINT) + (
+                (signal.SIGHUP,) if hasattr(signal, 'SIGHUP') else ()):
+            try:
+                signal.signal(_s, _sig_close)
+            except (ValueError, OSError):                 # not the main thread (embedded use)
+                pass
         self.root.after(400, self._eula_gate)            # one-time licence acceptance (post-splash)
         self.root.after(1500, self._auto_activate)       # seat + reveal for THIS install, no click
 
@@ -1218,8 +1264,12 @@ class App:
         nat = self._settings_inner.winfo_reqwidth()
         if nat <= 1:
             return                                       # pre-layout: nothing to measure yet
+        target = nat + int(48 * self.SCALE)
         try:
-            self._paned.sash_place(0, nat + int(48 * self.SCALE), 1)
+            # place only on a real move: sash_place re-runs ArrangePanes even for the same x,
+            # and _sync calls this from <Configure> — an unconditional place loops the layout
+            if abs(self._paned.sash_coord(0)[0] - target) > 1:
+                self._paned.sash_place(0, target, 1)
         except tk.TclError:
             pass
 
@@ -1245,7 +1295,15 @@ class App:
         canvas.create_window((0, 0), window=inner, anchor='nw')
 
         def _sync(_e=None):     # width is set by the content ITSELF — correct even with HiDPI font scaling
-            canvas.configure(width=inner.winfo_reqwidth(), scrollregion=canvas.bbox('all'))
+            w = inner.winfo_reqwidth()
+            region = canvas.bbox('all')
+            if getattr(canvas, '_an_synced', None) == (w, region):
+                return          # no real change. Reconfiguring anyway re-arms the pane layout:
+            #                     ArrangePanes emits synthetic <Configure> on every pass, which
+            #                     lands back here — an infinite 100%-CPU layout loop that pinned
+            #                     the app inside wm_deiconify (sampled 2026-08-18).
+            canvas._an_synced = (w, region)
+            canvas.configure(width=w, scrollregion=region)
             if self.cfg.get('settings_open'):
                 self._sash_restore()                     # content width changed (e.g. the timeframe
         inner.bind('<Configure>', _sync)                 # note) — the pane follows, fields never clip
@@ -3532,16 +3590,19 @@ class App:
             ALPHANODE_TEST_START=c['test_start'], ALPHANODE_TEST_END=c['test_end'],
         )
         self._contract_seal()                            # this session's frozen parameters
-        self.proc = subprocess.Popen(_child_cmd('node'), env=env,
-                                     cwd=(apppaths.USER_DIR if apppaths.FROZEN else PROJ),
-                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                     text=True, encoding='utf-8', errors='replace')
-        threading.Thread(target=self._reader, daemon=True).start()
+        # stdout -> a FILE, never a pipe: a pipe dies with the GUI, and then the orphaned node's
+        # freshly spawned pool workers get SIGPIPE on their first stderr write -> every round
+        # fails with BrokenPipeError (production incident 2026-08-05). The live feed comes from
+        # status.json anyway — the pipe was drained straight into the bin.
+        fh = open(os.path.join(STATE_DIR, 'node.log'), 'a', buffering=1,
+                  encoding='utf-8', errors='replace')
+        try:
+            self.proc = subprocess.Popen(_child_cmd('node'), env=env,
+                                         cwd=(apppaths.USER_DIR if apppaths.FROZEN else PROJ),
+                                         stdout=fh, stderr=subprocess.STDOUT)
+        finally:
+            fh.close()                                   # the child holds its own duplicate of the fd
         self._set_running(True)
-
-    def _reader(self):
-        for line in self.proc.stdout:
-            self.logq.put(line.rstrip())
 
     def stop(self):
         if self.proc and self.proc.poll() is None:
@@ -6597,6 +6658,23 @@ class App:
                         tb._set_image_for_button(ch)
                 elif isinstance(ch, tk.Label):
                     ch.configure(foreground=MUT)
+            if sys.platform == 'darwin':
+                # Aqua IGNORES configure(background=...) on native buttons — their chrome stays
+                # light no matter what Tk reports. mpl trusts cget('background') (our dark CARD)
+                # and swaps in the foreground-tinted icon: WHITE glyph on white chrome = blank
+                # squares. Force the original dark-glyph icons back — black on Aqua's light
+                # buttons reads fine; hover tooltips (Pan/Zoom/…) still name each action.
+                for ch in tb.winfo_children():
+                    img = getattr(ch, '_ntimage', None)
+                    if img is None:
+                        continue
+                    try:
+                        if isinstance(ch, tk.Checkbutton):
+                            ch.configure(image=img, selectimage=img)   # must move together (mpl DPI note)
+                        else:
+                            ch.configure(image=img)
+                    except tk.TclError:
+                        pass
             # Tk paints DISABLED image-buttons with a checkerboard stipple (ugly, and RGBA
             # icons flatten to a light block). Back/Forward are safe no-ops on an empty
             # history, so keep them enabled instead of letting mpl gray them out.

@@ -40,8 +40,9 @@ for name in "AlphaNode-Setup.exe" "AlphaNode-windows-portable.zip" "AlphaNode-ar
   done
   if [ -n "$src" ]; then
     cp "$src" "$STAGE/$name"
-    mb=$(( ($(stat -c%s "$STAGE/$name") + 524288) / 1048576 ))
-    if [ "$mb" -ge 1 ]; then size="${mb} MB"; else size="$(( ($(stat -c%s "$STAGE/$name")+512)/1024 )) KB"; fi
+    bytes=$(wc -c < "$STAGE/$name")                   # portable: GNU `stat -c%s` dies on macOS
+    mb=$(( (bytes + 524288) / 1048576 ))
+    if [ "$mb" -ge 1 ]; then size="${mb} MB"; else size="$(( (bytes+512)/1024 )) KB"; fi
     manifest+="$sep\"$name\": \"$size\""; sep=", "
     printf '  + %-34s %8s\n' "$name" "$size"
   else
